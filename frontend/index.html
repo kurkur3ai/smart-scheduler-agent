@@ -1,6 +1,137 @@
-<!-- index.html — Smart Scheduler Frontend (Component 6) -->
 <!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>Smart Scheduler</title></head>
-<body><h1>Smart Scheduler — coming in Component 6</h1></body>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Scheduler</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f7;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ── Auth gate ─────────────────────────────────── */
+    #auth-screen {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 24px;
+      background: #fff;
+      border-radius: 20px;
+      padding: 56px 48px;
+      box-shadow: 0 4px 32px rgba(0,0,0,.08);
+      max-width: 400px;
+      width: 90%;
+      text-align: center;
+    }
+    #auth-screen h1 { font-size: 1.6rem; color: #1d1d1f; }
+    #auth-screen p  { font-size: .95rem; color: #6e6e73; line-height: 1.5; }
+
+    .btn-google {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      background: #fff;
+      border: 1.5px solid #dadce0;
+      border-radius: 8px;
+      padding: 12px 24px;
+      font-size: 1rem;
+      font-weight: 500;
+      color: #3c4043;
+      cursor: pointer;
+      text-decoration: none;
+      transition: box-shadow .15s, border-color .15s;
+    }
+    .btn-google:hover {
+      box-shadow: 0 2px 8px rgba(0,0,0,.12);
+      border-color: #bbb;
+    }
+    .btn-google svg { flex-shrink: 0; }
+
+    /* ── Main app (placeholder until Component 6) ─── */
+    #app-screen {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+      background: #fff;
+      border-radius: 20px;
+      padding: 48px;
+      box-shadow: 0 4px 32px rgba(0,0,0,.08);
+      max-width: 560px;
+      width: 90%;
+      text-align: center;
+    }
+    #app-screen h1 { font-size: 1.6rem; color: #1d1d1f; }
+    #app-screen p  { font-size: .95rem; color: #6e6e73; }
+
+    .btn-logout {
+      margin-top: 8px;
+      background: none;
+      border: 1.5px solid #dadce0;
+      border-radius: 8px;
+      padding: 8px 20px;
+      font-size: .9rem;
+      color: #6e6e73;
+      cursor: pointer;
+      transition: border-color .15s;
+    }
+    .btn-logout:hover { border-color: #999; color: #333; }
+  </style>
+</head>
+<body>
+
+  <!-- Shown when not authenticated -->
+  <div id="auth-screen">
+    <h1>Smart Scheduler</h1>
+    <p>Your voice-enabled AI scheduling assistant.<br>Connect your Google Calendar to get started.</p>
+    <a class="btn-google" href="/auth/login">
+      <!-- Google G logo -->
+      <svg width="20" height="20" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+        <path fill="#EA4335" d="M24 9.5c3.14 0 5.95 1.08 8.17 2.84l6.1-6.1C34.46 3.09 29.5 1 24 1 14.82 1 7.07 6.48 3.6 14.27l7.1 5.52C12.45 13.27 17.76 9.5 24 9.5z"/>
+        <path fill="#4285F4" d="M46.5 24.5c0-1.64-.15-3.22-.43-4.75H24v9h12.65c-.55 2.96-2.2 5.46-4.7 7.14l7.27 5.65C43.44 37.5 46.5 31.45 46.5 24.5z"/>
+        <path fill="#FBBC05" d="M10.7 28.21A14.57 14.57 0 0 1 9.5 24c0-1.47.25-2.9.7-4.21L3.1 14.27A23.93 23.93 0 0 0 .5 24c0 3.87.93 7.53 2.6 10.73l7.6-6.52z"/>
+        <path fill="#34A853" d="M24 47c6.48 0 11.93-2.14 15.9-5.82l-7.27-5.65c-2.14 1.45-4.88 2.3-8.63 2.3-6.24 0-11.55-3.77-13.3-9.29l-7.6 6.52C7.07 41.52 14.82 47 24 47z"/>
+      </svg>
+      Login with Google Calendar
+    </a>
+  </div>
+
+  <!-- Shown after successful OAuth -->
+  <div id="app-screen">
+    <h1>Smart Scheduler</h1>
+    <p>You're connected to Google Calendar.<br>Full voice UI coming soon.</p>
+    <button class="btn-logout" onclick="logout()">Disconnect Calendar</button>
+  </div>
+
+  <script>
+    // On page load, ask the server whether this session is already authenticated.
+    // The server reads the HttpOnly cookie — JS never touches the token directly.
+    async function checkAuth() {
+      try {
+        const res = await fetch('/auth/status', { credentials: 'include' });
+        const { authenticated } = await res.json();
+        document.getElementById('auth-screen').style.display = authenticated ? 'none'  : 'flex';
+        document.getElementById('app-screen').style.display  = authenticated ? 'flex'  : 'none';
+      } catch {
+        // Network error — show login screen as safe default
+        document.getElementById('auth-screen').style.display = 'flex';
+      }
+    }
+
+    async function logout() {
+      await fetch('/auth/logout', { method: 'POST', credentials: 'include' });
+      checkAuth();
+    }
+
+    checkAuth();
+  </script>
+</body>
 </html>
+
