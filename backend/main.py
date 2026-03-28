@@ -9,11 +9,14 @@
 import os
 import secrets
 from datetime import date, timedelta
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Cookie, FastAPI
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
 
+from agent import run_agent
 from calendar_tool import (
     credentials_from_flow,
     get_free_slots,
@@ -33,8 +36,14 @@ _sessions: dict = {}
 # Maps OAuth state token -> session_id (prevents CSRF on the callback)
 _oauth_states: dict[str, str] = {}
 
+# Maps session_id -> conversation history (list of {role, content} dicts)
+# Enhanced with entity extraction + expiry in Component 5.
+_conversations: dict[str, list] = {}
+
 COOKIE_NAME = "ss_session"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+
+FRONTEND = Path(__file__).parent.parent / "frontend" / "index.html"
 
 
 def _get_valid_credentials(session_id: str | None):
@@ -59,6 +68,11 @@ def _get_valid_credentials(session_id: str | None):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "smart-scheduler"}
+
+
+@app.get("/")
+async def serve_frontend():
+    return FileResponse(FRONTEND, media_type="text/html")
 
 
 # ── OAuth ──────────────────────────────────────────────────────────────────────
@@ -189,3 +203,50 @@ async def test_calendar(
         "available_slots": slots,
         "count": len(slots),
     }
+
+
+# ── Chat ───────────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+    timezone: str = "UTC"
+
+
+@app.post("/chat")
+async def chat(
+    body: ChatRequest,
+    ss_session: str = Cookie(default=None),
+):
+    """
+    Send a text message to the scheduling agent and receive a text reply.
+
+    The agent may call get_free_slots or book_slot transparently — the
+    caller only ever sees the final natural-language response.
+
+    Requires the ss_session cookie (set by /auth/login → /auth/callback).
+    """
+    creds = _get_valid_credentials(ss_session)
+    if not creds:
+        return JSONResponse(
+            {
+                "error": "Not authenticated.",
+                "fix": "Visit /auth/login first.",
+            },
+            status_code=401,
+        )
+
+    history = _conversations.get(ss_session, [])
+
+    try:
+        reply, updated_history = run_agent(
+            user_message=body.message,
+            history=history,
+            credentials=creds,
+            user_timezone=body.timezone,
+        )
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+    _conversations[ss_session] = updated_history
+    return {"reply": reply}
+
