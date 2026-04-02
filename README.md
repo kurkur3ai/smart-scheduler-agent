@@ -57,7 +57,7 @@ Browser
   │                                                    │    obvious confirm/cancel words)
   │                                                    │
   │                                                    ├─ Step 1: intent.extract_intent()
-  │                                                    │   LLM: llama-3.1-8b-instant
+  │                                                    │   LLM: llama-3.3-70b-versatile
   │                                                    │   ~150 input tokens → JSON intent
   │                                                    │
   │                                                    └─ Step 2: _route()
@@ -84,9 +84,11 @@ Browser
 | Step | LLM calls | Approx. tokens |
 |---|---|---|
 | Step 0: fast intent (set lookup) | 0 | 0 |
-| Step 1: intent extraction | 1 (8b model) | ~150 in / ~100 out |
+| Step 1: intent extraction | 1 (70b model) | ~150 in / ~100 out |
 | Step 2: routing + calendar ops | 0 | 0 |
-| **Total per turn** | **1** | **~250** |
+| Step 3: NL fallback (unknown intent only) | 0 or 1 | ~80 out |
+| **Typical turn (known intent)** | **1** | **~250** |
+| **Worst case (unknown intent)** | **2** | **~330** |
 | Old tool-calling approach | 2–3 | ~4,000–7,200 |
 
 ---
@@ -238,9 +240,13 @@ Zero LLM calls. The router executes Python calendar operations based on the inte
 - **`list_events`** — calls `get_events_for_day()` and formats the event list
 - **`search_event`** — calls `search_event()` against the next 7 days
 
+### Step 3 — NL Fallback (unknown intent only)
+
+If the router returns `None` (intent was `"unknown"`), a second LLM call is made — ~80 output tokens — using a minimal system prompt that constrains the model to scheduling topics only. This only fires when the request genuinely doesn't map to any scheduling action.
+
 ### Freebusy Cache
 
-Each session maintains an in-memory `_slot_cache` keyed by `"date:tz_name"` with a 60-second TTL. This prevents redundant Google Calendar freebusy API calls when the same day is referenced multiple times in a single conversation (e.g., checking a slot then offering alternatives on the same day).
+Each session maintains an in-memory `_slot_cache` keyed by `"date:tz_name"` with a **5-minute (300-second) TTL**. This prevents redundant Google Calendar freebusy API calls when the same day is referenced multiple times in a single conversation (e.g., checking a slot then offering alternatives on the same day).
 
 ---
 
@@ -390,8 +396,8 @@ The `ENVIRONMENT=production` value is hardcoded in `render.yaml`. In production:
 | Layer | Technology |
 |---|---|
 | Backend framework | FastAPI + Uvicorn |
-| LLM inference (primary) | Groq — `llama-3.3-70b-versatile` (fallback/complex turns) |
-| LLM inference (intent) | Groq — `llama-3.1-8b-instant` (Step 1, ~150 tokens/turn) |
+| LLM inference (primary) | Groq — `llama-3.3-70b-versatile` (Step 1 intent extraction + Step 3 NL fallback) |
+| LLM inference (rate-limit fallback) | Groq — `llama-3.1-8b-instant` (used when 70b is rate-limited) |
 | Speech-to-text | Groq Whisper — `whisper-large-v3-turbo` |
 | Text-to-speech | Groq Orpheus — `canopylabs/orpheus-v1-english` |
 | Calendar integration | Google Calendar API v3 |
