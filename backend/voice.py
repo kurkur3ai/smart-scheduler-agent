@@ -39,6 +39,7 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> str:
         result = client.audio.transcriptions.create(
             file=(filename, audio_bytes),
             model="whisper-large-v3-turbo",
+            language="en",
         )
         text = result.text if hasattr(result, "text") else str(result)
         log.info("[voice] transcribed %d bytes → %d chars", len(audio_bytes), len(text))
