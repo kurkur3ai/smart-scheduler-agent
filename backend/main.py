@@ -108,6 +108,15 @@ _conversations: dict[str, list] = {}
 # Avoids redundant Google API calls when availability was already checked this session.
 _slot_cache: dict[str, dict] = {}
 
+# Debounce: reject duplicate requests within DEBOUNCE_SECONDS from the same session
+_last_chat_time: dict[str, float] = {}
+DEBOUNCE_SECONDS = 1.0
+
+
+def _est_tokens(text: str) -> int:
+    """Rough token estimate (4 chars ≈ 1 token). Only used for logging."""
+    return max(1, len(text) // 4)
+
 COOKIE_NAME = "ss_session"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 
@@ -329,6 +338,12 @@ async def chat(
             status_code=401,
         )
 
+    # Debounce: reject requests hammered faster than DEBOUNCE_SECONDS
+    now_ts = time.monotonic()
+    if now_ts - _last_chat_time.get(ss_session, 0) < DEBOUNCE_SECONDS:
+        return JSONResponse({"error": "Too many requests. Please wait a moment."}, status_code=429)
+    _last_chat_time[ss_session] = now_ts
+
     history = _conversations.get(ss_session, [])
     slot_cache = _slot_cache.setdefault(ss_session, {})
 
@@ -350,8 +365,10 @@ async def chat(
 
     # Log per-step breakdown in dev
     if _is_dev:
+        msg_tokens = _est_tokens(body.message)
+        log.info("  [tokens] user_message ~%d tokens", msg_tokens)
         for gc in agent_timing.get("groq_calls", []):
-            log.info("  [timing] LLM call iter=%d: %dms", gc["iter"], gc["ms"])
+            log.info("  [timing] LLM call iter=%s: %dms", gc["iter"], gc["ms"])
         for tc in agent_timing.get("tools", []):
             log.info("  [timing] tool %-25s: %dms", tc["name"], tc["ms"])
         log.info("  [timing] agent total: %dms", agent_timing.get("total_ms", 0))

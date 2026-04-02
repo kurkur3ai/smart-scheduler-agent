@@ -69,6 +69,8 @@ def speak_text(text: str) -> bytes:
         clean = re.sub(r'_{1,2}(.*?)_{1,2}', r'\1', clean)      # underscore bold/italic
         clean = re.sub(r'`+.*?`+', '', clean)                      # inline code
         clean = re.sub(r'^#{1,6}\s*', '', clean, flags=re.MULTILINE)  # headings
+        # Replace time-range dashes/en-dashes with 'to' so TTS reads naturally
+        clean = re.sub(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[\u2013\u2014-]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', r'\1 to \2', clean)
         clean = clean.strip()
         # Orpheus has a 200-character input limit
         truncated = clean[:200]

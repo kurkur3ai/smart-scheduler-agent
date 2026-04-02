@@ -118,9 +118,7 @@ def _fetch_day_data(
     tz_name: str,
     busy_cache: dict | None,
 ) -> dict:
-    """Fetch or return cached events for an entire calendar day.
-    Uses events().list() to return both busy periods and event titles in one call.
-    Cache key = date:tz_name. Returns {"busy": [...], "events": [...], "expires": float}"""
+    """Fetch or return cached data for an entire calendar day."""
     bkey = f"{date}:{tz_name}"
     if busy_cache is not None and bkey in busy_cache:
         entry = busy_cache[bkey]
@@ -129,15 +127,72 @@ def _fetch_day_data(
             return entry
 
     creds = refresh_if_expired(creds)
+    _t = time.perf_counter()
+    service = _get_service(creds)
+    log.debug("[timing] calendar_build  %.0fms", (time.perf_counter() - _t) * 1000)
+    data = _fetch_day_data_with_service(service, creds, date, tz_name, busy_cache)
+    return data
+
+
+def _fetch_day_data_with_service(
+    service,
+    creds: Credentials,
+    date: str,
+    tz_name: str,
+    busy_cache: dict | None,
+) -> dict:
+    """Core freebusy fetch using a caller-supplied service object.
+    Thread-safe: each caller must pass its own service instance.
+    Cache key = date:tz_name. Returns {"busy": [...], "events": None, "expires": float}"""
+    bkey = f"{date}:{tz_name}"
     tz = ZoneInfo(tz_name)
     day = datetime.strptime(date, "%Y-%m-%d")
     day_start = day.replace(hour=0, minute=0, second=0, tzinfo=tz)
     day_end = (day + timedelta(days=1)).replace(hour=0, minute=0, second=0, tzinfo=tz)
 
-    _t = time.perf_counter()
-    service = _get_service(creds)
-    log.debug("[timing] calendar_build  %.0fms", (time.perf_counter() - _t) * 1000)
+    # Query ALL user calendars via freebusy
+    try:
+        _t = time.perf_counter()
+        cal_list = service.calendarList().list(minAccessRole="freeBusyReader").execute()
+        cal_ids = [{"id": c["id"]} for c in cal_list.get("items", [{"id": "primary"}])]
+        body = {"timeMin": day_start.isoformat(), "timeMax": day_end.isoformat(), "items": cal_ids}
+        result = service.freebusy().query(body=body).execute()
+        log.debug("[timing] freebusy_query  %.0fms", (time.perf_counter() - _t) * 1000)
+    except Exception as exc:
+        raise RuntimeError(f"Google Calendar API error: {exc}") from exc
 
+    # Merge busy periods from all calendars
+    busy_raw: list[dict] = []
+    for cal_data in result.get("calendars", {}).values():
+        busy_raw.extend(cal_data.get("busy", []))
+    data: dict = {"busy": busy_raw, "events": None, "expires": time.time() + 300}
+    if busy_cache is not None:
+        busy_cache[bkey] = data
+    return data
+
+
+def _fetch_events_for_day(
+    creds: Credentials,
+    date: str,
+    tz_name: str,
+    busy_cache: dict | None,
+) -> list[dict]:
+    """Fetch primary calendar event titles for a day. Called only when titles are needed.
+    Stores results back into the cache entry to avoid double fetching."""
+    bkey = f"{date}:{tz_name}"
+    # Return cached events if already fetched
+    if busy_cache is not None and bkey in busy_cache:
+        entry = busy_cache[bkey]
+        if entry.get("events") is not None:
+            return entry["events"]
+
+    creds = refresh_if_expired(creds)
+    tz = ZoneInfo(tz_name)
+    day = datetime.strptime(date, "%Y-%m-%d")
+    day_start = day.replace(hour=0, minute=0, second=0, tzinfo=tz)
+    day_end = (day + timedelta(days=1)).replace(hour=0, minute=0, second=0, tzinfo=tz)
+
+    service = _get_service(creds)
     try:
         _t = time.perf_counter()
         result = service.events().list(
@@ -151,21 +206,17 @@ def _fetch_day_data(
     except Exception as exc:
         raise RuntimeError(f"Google Calendar API error: {exc}") from exc
 
-    busy: list[dict] = []
-    events: list[dict] = []
+    events = []
     for item in result.get("items", []):
         start_str = item.get("start", {}).get("dateTime")
         end_str = item.get("end", {}).get("dateTime")
         if not start_str or not end_str:
-            continue  # skip all-day events
-        title = item.get("summary", "(No title)")
-        busy.append({"start": start_str, "end": end_str})
-        events.append({"title": title, "start": start_str, "end": end_str})
+            continue
+        events.append({"title": item.get("summary", "(No title)"), "start": start_str, "end": end_str})
 
-    data: dict = {"busy": busy, "events": events, "expires": time.time() + 300}
-    if busy_cache is not None:
-        busy_cache[bkey] = data
-    return data
+    if busy_cache is not None and bkey in busy_cache:
+        busy_cache[bkey]["events"] = events
+    return events
 
 
 def compute_free_windows(
@@ -326,9 +377,8 @@ def get_events_for_day(
     tz_name: str = "UTC",
     busy_cache: dict | None = None,
 ) -> list[dict]:
-    """Return events with titles for a day. Uses cache if already fetched — no extra API call."""
-    data = _fetch_day_data(creds, date, tz_name, busy_cache)
-    return data.get("events", [])
+    """Return events with titles for a day. Lazy-fetches via events().list() separately from freebusy."""
+    return _fetch_events_for_day(creds, date, tz_name, busy_cache)
 
 
 def search_event(
@@ -413,7 +463,12 @@ def find_slot_in_range(
 
     def _fetch(date_str: str) -> tuple:
         try:
-            return date_str, _fetch_day_data(creds, date_str, tz_name, None)
+            # Build a per-thread service to avoid httplib2 thread-safety issues
+            thread_service = build(
+                "calendar", "v3", credentials=creds,
+                cache=_DISCOVERY_CACHE, static_discovery=True,
+            )
+            return date_str, _fetch_day_data_with_service(thread_service, creds, date_str, tz_name, None)
         except Exception as exc:
             log.error("[tool] find_slot_in_range fetch error %s: %s", date_str, exc)
             return date_str, None
