@@ -1,1 +1,24 @@
-# render.yaml — Render deployment config (Component 7)
+# render.yaml — Render deployment config
+
+services:
+  - type: web
+    name: smart-scheduler
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: GROQ_API_KEY
+        sync: false          # set manually in Render dashboard
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false          # set to https://<your-app>.onrender.com/auth/callback
+      - key: SECRET_KEY
+        sync: false          # set manually — never commit the real value
+    healthCheckPath: /health

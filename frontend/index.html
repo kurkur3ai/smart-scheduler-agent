@@ -54,35 +54,157 @@
     }
     .btn-google svg { flex-shrink: 0; }
 
-    /* ── Main app (placeholder until Component 6) ─── */
+    /* ── Main app ────────────────────────────────── */
     #app-screen {
       display: none;
       flex-direction: column;
-      align-items: center;
       gap: 16px;
       background: #fff;
       border-radius: 20px;
-      padding: 48px;
+      padding: 36px 40px;
       box-shadow: 0 4px 32px rgba(0,0,0,.08);
-      max-width: 560px;
+      max-width: 600px;
       width: 90%;
-      text-align: center;
     }
-    #app-screen h1 { font-size: 1.6rem; color: #1d1d1f; }
-    #app-screen p  { font-size: .95rem; color: #6e6e73; }
+    #app-screen h1 { font-size: 1.4rem; color: #1d1d1f; text-align: center; }
+
+    /* Chat transcript */
+    #transcript {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 340px;
+      overflow-y: auto;
+      padding: 12px;
+      background: #f5f5f7;
+      border-radius: 12px;
+      min-height: 80px;
+    }
+    .bubble {
+      max-width: 80%;
+      padding: 10px 14px;
+      border-radius: 16px;
+      font-size: .93rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: #0071e3;
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+    .bubble.agent {
+      align-self: flex-start;
+      background: #e5e5ea;
+      color: #1d1d1f;
+      border-bottom-left-radius: 4px;
+    }
+    .bubble.thinking {
+      align-self: flex-start;
+      background: #e5e5ea;
+      color: #888;
+      font-style: italic;
+      border-bottom-left-radius: 4px;
+    }
+
+    /* Input row */
+    #input-row {
+      display: flex;
+      gap: 8px;
+    }
+    #msg-input {
+      flex: 1;
+      border: 1.5px solid #dadce0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: .95rem;
+      outline: none;
+      transition: border-color .15s;
+    }
+    #msg-input:focus { border-color: #0071e3; }
+
+    .btn-send {
+      background: #0071e3;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 20px;
+      font-size: .95rem;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .btn-send:hover { background: #0058b0; }
+    .btn-send:disabled { background: #aaa; cursor: not-allowed; }
+
+    .btn-mic {
+      background: #f5f5f7;
+      border: 1.5px solid #dadce0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background .15s, border-color .15s;
+      flex-shrink: 0;
+    }
+    .btn-mic:hover { background: #e8e8ed; border-color: #bbb; }
+    .btn-mic.recording { background: #ff3b30; border-color: #ff3b30; color: #fff; }
+    .btn-mic.blocked  { background: #fff3f3; border-color: #ff3b30; color: #ff3b30; }
+    .btn-mic:disabled { opacity: .5; cursor: not-allowed; }
+
+    #mic-status {
+      font-size: .78rem;
+      min-height: 1.1em;
+      color: #6e6e73;
+      text-align: center;
+      padding: 2px 4px;
+    }
+    #mic-status.error { color: #ff3b30; }
 
     .btn-logout {
-      margin-top: 8px;
+      align-self: flex-end;
       background: none;
       border: 1.5px solid #dadce0;
       border-radius: 8px;
-      padding: 8px 20px;
-      font-size: .9rem;
+      padding: 6px 16px;
+      font-size: .85rem;
       color: #6e6e73;
       cursor: pointer;
       transition: border-color .15s;
     }
-    .btn-logout:hover { border-color: #999; color: #333; }
+    /* ── Voice UI (production only) ─────────────── */
+    #voice-ui {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 0 4px;
+      color: #6e6e73;
+      font-size: .9rem;
+    }
+
+    /* ── Dev timing panel ────────────────────────── */
+    #timing-panel {
+      display: none;
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: .75rem;
+      background: #1c1c1e;
+      color: #e5e5ea;
+      border-radius: 10px;
+      padding: 10px 14px;
+      line-height: 1.7;
+    }
+    #timing-panel .tp-header {
+      font-weight: 600;
+      color: #ffd60a;
+      margin-bottom: 4px;
+      letter-spacing: .04em;
+    }
+    #timing-panel .tp-row { display: flex; justify-content: space-between; gap: 20px; }
+    #timing-panel .tp-label { color: #98989d; }
+    #timing-panel .tp-val  { color: #30d158; font-weight: 600; }
+    #timing-panel .tp-sub  { color: #636366; padding-left: 10px; }
+    #timing-panel .tp-total { color: #ff9f0a; font-weight: 700; border-top: 1px solid #3a3a3c; margin-top: 4px; padding-top: 4px; }
   </style>
 </head>
 <body>
@@ -106,23 +228,112 @@
   <!-- Shown after successful OAuth -->
   <div id="app-screen">
     <h1>Smart Scheduler</h1>
-    <p>You're connected to Google Calendar.<br>Full voice UI coming soon.</p>
+
+    <div id="transcript">
+      <div class="bubble agent">Hi! I'm your Smart Scheduler. Tell me when you'd like to meet and I'll check your calendar.</div>
+    </div>
+
+    <div id="input-row">
+      <input id="msg-input" type="text" placeholder="e.g. Schedule a 30 min meeting tomorrow afternoon…" autocomplete="off" />
+      <button class="btn-mic" id="mic-btn" onclick="toggleMic()" title="Click to speak">🎤</button>
+      <button class="btn-send" id="send-btn" onclick="sendMessage()">Send</button>
+    </div>
+    <div id="mic-status"></div>
+
+    <!-- Voice UI placeholder — hidden, mic is now in input row -->
+    <div id="voice-ui" style="display:none"></div>
+
     <button class="btn-logout" onclick="logout()">Disconnect Calendar</button>
+
+    <!-- Dev-mode timing panel — rendered by showTiming() -->
+    <div id="timing-panel"></div>
   </div>
 
   <script>
-    // On page load, ask the server whether this session is already authenticated.
-    // The server reads the HttpOnly cookie — JS never touches the token directly.
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    let appMode = 'development'; // set by /config on load
+
+    // ── Dev timing state ───────────────────────────────────────────────────
+    let _micStoppedAt = null;   // Date.now() when recording stopped
+    let _sttMs = null;
+    let _chatTiming = null;     // full timing object from /chat
+    let _ttsMs = null;
+
+    function _resetTiming() {
+      _micStoppedAt = null; _sttMs = null; _chatTiming = null; _ttsMs = null;
+    }
+
+    function showTiming({ sttMs, chatTiming, ttsMs, micToVoiceMs }) {
+      if (appMode !== 'development') return;
+      const panel = document.getElementById('timing-panel');
+      if (!panel) return;
+      panel.style.display = 'block';
+
+      const row = (label, val, sub) =>
+        `<div class="tp-row"><span class="tp-label">${label}</span><span class="tp-val">${val}</span></div>` +
+        (sub ? `<div class="tp-sub">${sub}</div>` : '');
+
+      let html = '<div class="tp-header">⏱ Request Timing</div>';
+
+      if (sttMs != null)
+        html += row('STT (Whisper)', `${sttMs} ms`);
+
+      if (chatTiming) {
+        const gcSubs = (chatTiming.groq_calls || [])
+          .map(g => `iter ${g.iter}: ${g.ms} ms`).join(' · ');
+        const toolSubs = (chatTiming.tools || [])
+          .map(t => `${t.name}: ${t.ms} ms`).join('<br>');
+        html += row('LLM (Groq)', `${chatTiming.total_ms} ms`, gcSubs || null);
+        if (toolSubs) html += `<div class="tp-sub">${toolSubs}</div>`;
+      }
+
+      if (ttsMs != null)
+        html += row('TTS (Orpheus)', `${ttsMs} ms`);
+
+      if (micToVoiceMs != null)
+        html += `<div class="tp-row tp-total"><span>🎙 Mic stop → first audio</span><span>${micToVoiceMs} ms</span></div>`;
+
+      panel.innerHTML = html;
+
+      // Also log to console in a table
+      const rows = [];
+      if (sttMs != null) rows.push({ step: 'STT', ms: sttMs });
+      if (chatTiming) {
+        (chatTiming.groq_calls || []).forEach(g => rows.push({ step: `LLM iter${g.iter}`, ms: g.ms }));
+        (chatTiming.tools || []).forEach(t => rows.push({ step: `tool:${t.name}`, ms: t.ms }));
+        rows.push({ step: 'Agent total', ms: chatTiming.total_ms });
+      }
+      if (ttsMs != null) rows.push({ step: 'TTS', ms: ttsMs });
+      if (micToVoiceMs != null) rows.push({ step: '*** Mic→Voice ***', ms: micToVoiceMs });
+      console.table(rows);
+    }
+
     async function checkAuth() {
       try {
-        const res = await fetch('/auth/status', { credentials: 'include' });
-        const { authenticated } = await res.json();
-        document.getElementById('auth-screen').style.display = authenticated ? 'none'  : 'flex';
-        document.getElementById('app-screen').style.display  = authenticated ? 'flex'  : 'none';
+        const [authRes, cfgRes] = await Promise.all([
+          fetch('/auth/status', { credentials: 'include' }),
+          fetch('/config'),
+        ]);
+        const { authenticated } = await authRes.json();
+        const { mode } = await cfgRes.json();
+        appMode = mode;
+
+        document.getElementById('auth-screen').style.display = authenticated ? 'none' : 'flex';
+        document.getElementById('app-screen').style.display  = authenticated ? 'flex' : 'none';
+
+        if (authenticated) {
+          applyMode(mode);
+        }
       } catch {
-        // Network error — show login screen as safe default
         document.getElementById('auth-screen').style.display = 'flex';
       }
+    }
+
+    function applyMode(mode) {
+      // Mic button is always in the input row; show chat for all modes
+      document.getElementById('input-row').style.display    = 'flex';
+      document.getElementById('transcript').style.display   = 'flex';
+      document.getElementById('voice-ui').style.display     = 'none';
     }
 
     async function logout() {
@@ -130,7 +341,245 @@
       checkAuth();
     }
 
-    checkAuth();
+    function addBubble(role, text) {
+      const t = document.getElementById('transcript');
+      const div = document.createElement('div');
+      div.className = `bubble ${role}`;
+      if (role === 'agent') {
+        // Render **bold** safely: escape HTML first, then apply bold
+        const esc = text
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        div.innerHTML = esc.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      } else {
+        div.textContent = text;
+      }
+      t.appendChild(div);
+      t.scrollTop = t.scrollHeight;
+      return div;
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById('msg-input');
+      const btn   = document.getElementById('send-btn');
+      const text  = input.value.trim();
+      if (!text) return;
+
+      input.value = '';
+      btn.disabled = true;
+      addBubble('user', text);
+      const thinking = addBubble('thinking', 'Thinking…');
+
+      // Reset timing panel for text-only messages (voice flow resets in stopRecording)
+      if (_micStoppedAt === null) _resetTiming();
+      // Hide stale timing
+      const panel = document.getElementById('timing-panel');
+      if (panel) panel.style.display = 'none';
+
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ message: text, timezone: tz }),
+        });
+        const data = await res.json();
+        thinking.remove();
+        const reply = data.reply || data.error || 'Something went wrong.';
+        if (data.timing) _chatTiming = data.timing;
+        addBubble('agent', reply);
+        if (data.reply) speakReply(data.reply);
+        // For text-only (no mic), show timing without mic-to-voice stat
+        if (_micStoppedAt === null && appMode === 'development') {
+          showTiming({ sttMs: null, chatTiming: _chatTiming, ttsMs: null, micToVoiceMs: null });
+        }
+      } catch (e) {
+        thinking.remove();
+        addBubble('agent', 'Network error — is the server running?');
+      } finally {
+        btn.disabled = false;
+        input.focus();
+      }
+    }
+
+    // ── Mic status helper (never uses chat bubbles) ────────────────────────
+    function setMicStatus(msg, isError) {
+      const el = document.getElementById('mic-status');
+      el.textContent = msg;
+      el.className = isError ? 'error' : '';
+    }
+
+    // ── Voice (mic + TTS) ──────────────────────────────────────────────────
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+
+    async function toggleMic() {
+      if (isRecording) { stopRecording(); } else { await startRecording(); }
+    }
+
+    async function startRecording() {
+      // Reset any previous blocked state so the button is always clickable
+      const btn = document.getElementById('mic-btn');
+      btn.classList.remove('blocked');
+      setMicStatus('Requesting mic…');
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setMicStatus('Mic API unavailable — use Chrome or Firefox', true);
+        return;
+      }
+
+      // Check if mic is already blocked before calling getUserMedia
+      if (navigator.permissions) {
+        try {
+          const perm = await navigator.permissions.query({ name: 'microphone' });
+          if (perm.state === 'denied') {
+            btn.classList.add('blocked');
+            setMicStatus('Mic blocked by browser — click 🔒 in the address bar → Microphone → Allow → then refresh', true);
+            return;
+          }
+        } catch { /* permissions API unsupported, proceed */ }
+      }
+
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        console.error('[mic] getUserMedia:', err.name, err.message);
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setMicStatus('Permission denied — click 🔒 in address bar → Site settings → Microphone → Allow → refresh', true);
+        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+          setMicStatus('No mic found — Chrome blocked it. Click 🔒 → Site settings → Microphone → Allow → refresh', true);
+        } else if (err.name === 'NotReadableError') {
+          setMicStatus('Mic in use by another app — close it and try again', true);
+        } else {
+          setMicStatus(`Mic error [${err.name}]: ${err.message}`, true);
+        }
+        return;
+      }
+
+      // Stream acquired — set up recorder
+      try {
+        audioChunks = [];
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
+        console.log('[mic] mimeType:', mimeType);
+
+        mediaRecorder = new MediaRecorder(stream, { mimeType });
+        mediaRecorder.ondataavailable = e => {
+          console.log('[mic] data chunk:', e.data.size);
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+        mediaRecorder.onerror = e => {
+          console.error('[mic] recorder error:', e.error);
+          setMicStatus(`Recorder error: ${e.error?.message || e}`, true);
+        };
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(t => t.stop());
+          const totalBytes = audioChunks.reduce((n, c) => n + c.size, 0);
+          console.log('[mic] recording stopped, chunks:', audioChunks.length, 'bytes:', totalBytes);
+          if (totalBytes === 0) {
+            setMicStatus('No audio captured — try holding the button longer', true);
+            return;
+          }
+          const ext = mimeType.includes('mp4') ? 'audio.mp4' : 'audio.webm';
+          const blob = new Blob(audioChunks, { type: mimeType });
+          await handleAudioBlob(blob, ext);
+        };
+
+        // timeslice=250ms ensures data arrives even if recording is short
+        mediaRecorder.start(250);
+        isRecording = true;
+        btn.classList.add('recording');
+        btn.textContent = '⏹';
+        btn.title = 'Click to stop recording';
+        setMicStatus('🔴 Recording… click ⏹ to send');
+      } catch (err) {
+        stream.getTracks().forEach(t => t.stop());
+        console.error('[mic] recorder setup error:', err);
+        setMicStatus(`Recorder setup failed: ${err.message}`, true);
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      isRecording = false;
+      const stoppedAt = Date.now();  // capture before reset clears state
+      _sttMs = null; _chatTiming = null; _ttsMs = null;  // reset per-request timing
+      _micStoppedAt = stoppedAt;  // keep mic stamp for end-to-end measurement
+      const btn = document.getElementById('mic-btn');
+      btn.classList.remove('recording');
+      btn.textContent = '🎤';
+      btn.title = 'Click to speak';
+      setMicStatus('Processing…');
+    }
+
+    async function handleAudioBlob(blob, filename) {
+      const btn = document.getElementById('mic-btn');
+      btn.disabled = true;
+      btn.textContent = '⏳';
+      setMicStatus('Transcribing…');
+      try {
+        const form = new FormData();
+        form.append('audio', blob, filename);
+        const res = await fetch('/voice/transcribe', {
+          method: 'POST', credentials: 'include', body: form,
+        });
+        const data = await res.json();
+        setMicStatus('');
+        if (!res.ok) {
+          setMicStatus(`Transcription error: ${data.error || res.statusText}`, true);
+          return;
+        }
+        if (data.timing_ms != null) _sttMs = data.timing_ms;
+        if (data.text && data.text.trim()) {
+          document.getElementById('msg-input').value = data.text.trim();
+          sendMessage();
+        } else {
+          setMicStatus("Couldn't hear anything clearly — try again", true);
+        }
+      } catch (err) {
+        setMicStatus(`Transcription failed: ${err.message}`, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🎤';
+      }
+    }
+
+    async function speakReply(text) {
+      try {
+        const res = await fetch('/voice/synthesize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ text }),
+        });
+        if (!res.ok) return;  // TTS is best-effort; silently ignore API errors
+        const ttsTimingMs = res.headers.get('X-Timing-Ms');
+        if (ttsTimingMs != null) _ttsMs = parseInt(ttsTimingMs, 10);
+        const buf = await res.arrayBuffer();
+        // Stamp end-to-end time here — audio bytes received from server.
+        // This is the true mic-stop → audio-delivered latency.
+        const micToVoiceMs = _micStoppedAt ? Date.now() - _micStoppedAt : null;
+        if (appMode === 'development') {
+          showTiming({ sttMs: _sttMs, chatTiming: _chatTiming, ttsMs: _ttsMs, micToVoiceMs });
+        }
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const decoded = await audioCtx.decodeAudioData(buf);
+        const src = audioCtx.createBufferSource();
+        src.buffer = decoded;
+        src.connect(audioCtx.destination);
+        src.start();
+      } catch { /* best-effort */ }
+    }
+
+    // Allow Enter key to send
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('msg-input').addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) sendMessage();
+      });
+      checkAuth();
+    });
   </script>
 </body>
 </html>
