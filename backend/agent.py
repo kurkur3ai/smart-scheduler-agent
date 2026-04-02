@@ -175,7 +175,9 @@ def _route(
 
     # Guard: if time matches not_after or not_before, the LLM confused deadline for start time.
     # Move it to the appropriate constraint and route to find_slot instead.
-    constraints = intent.setdefault("constraints", {})
+    # Use `or {}` to handle both missing key AND key present with null value from LLM.
+    constraints = intent.get("constraints") or {}
+    intent["constraints"] = constraints
     if time_val and not is_period:
         not_after_val = constraints.get("not_after")
         not_before_val = constraints.get("not_before")
