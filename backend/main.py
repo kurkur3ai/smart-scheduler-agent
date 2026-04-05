@@ -100,10 +100,6 @@ _sessions: dict = {}
 # Maps OAuth state token -> session_id (prevents CSRF on the callback)
 _oauth_states: dict[str, str] = {}
 
-# Maps session_id -> conversation history (list of {role, content} dicts)
-# Enhanced with entity extraction + expiry in Component 5.
-_conversations: dict[str, list] = {}
-
 # Per-session freebusy cache: {session_id: {"date:sh:eh": {"result": ..., "expires": float}}}
 # Avoids redundant Google API calls when availability was already checked this session.
 _slot_cache: dict[str, dict] = {}
@@ -168,7 +164,15 @@ async def config():
 
 @app.get("/")
 async def serve_frontend():
-    return FileResponse(FRONTEND, media_type="text/html")
+    # Cross-Origin-Opener-Policy + Cross-Origin-Embedder-Policy (credentialless)
+    # makes the page cross-origin isolated, which enables SharedArrayBuffer.
+    # SharedArrayBuffer is required by onnxruntime-web's threaded WASM backend
+    # (used internally by @ricky0123/vad-web).  credentialless COEP (vs
+    # require-corp) lets CDN scripts load without needing CORP headers.
+    response = FileResponse(FRONTEND, media_type="text/html")
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
+    return response
 
 
 # ── OAuth ──────────────────────────────────────────────────────────────────────
@@ -344,14 +348,12 @@ async def chat(
         return JSONResponse({"error": "Too many requests. Please wait a moment."}, status_code=429)
     _last_chat_time[ss_session] = now_ts
 
-    history = _conversations.get(ss_session, [])
     slot_cache = _slot_cache.setdefault(ss_session, {})
 
     t_chat = time.monotonic()
     try:
-        reply, updated_history, agent_timing = run_agent(
+        reply, agent_timing = run_agent(
             user_message=body.message,
-            history=history,
             credentials=creds,
             user_timezone=body.timezone,
             slot_cache=slot_cache,
@@ -361,7 +363,7 @@ async def chat(
         return JSONResponse({"error": str(exc)}, status_code=502)
 
     chat_total_ms = round((time.monotonic() - t_chat) * 1000)
-    log.info("[chat] session=%s... turns=%d total=%dms", ss_session[:8], len(updated_history) // 2, chat_total_ms)
+    log.info("[chat] session=%s... total=%dms", ss_session[:8], chat_total_ms)
 
     # Log per-step breakdown in dev
     if _is_dev:
@@ -373,7 +375,6 @@ async def chat(
             log.info("  [timing] tool %-25s: %dms", tc["name"], tc["ms"])
         log.info("  [timing] agent total: %dms", agent_timing.get("total_ms", 0))
 
-    _conversations[ss_session] = updated_history
     resp: dict = {"reply": reply}
     if _is_dev:
         resp["timing"] = agent_timing
@@ -446,6 +447,20 @@ async def voice_synthesize(
     headers = {"X-Timing-Ms": str(tts_ms)} if _is_dev else {}
     return Response(content=audio_bytes, media_type="audio/wav", headers=headers)
 
+
+# ── Session reset ──────────────────────────────────────────────────────────────
+
+@app.post("/session/reset")
+async def session_reset(ss_session: str = Cookie(default=None)):
+    """
+    Clear conversation history and slot cache for the current session.
+    Google credentials are preserved — the user stays logged in.
+    """
+    if not _get_valid_credentials(ss_session):
+        return JSONResponse({"error": "Not authenticated."}, status_code=401)
+    _slot_cache.pop(ss_session, None)
+    log.info("[reset] session cleared: %s...", ss_session[:8])
+    return {"ok": True}
 
 
 if __name__ == "__main__":

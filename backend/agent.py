@@ -35,7 +35,11 @@ MODEL_FALLBACK = "llama-3.1-8b-instant"
 
 def _fmt_time(dt: datetime) -> str:
     hour = int(dt.strftime("%I"))  # strips leading zero, cross-platform
-    return f"{hour}:{dt.strftime('%M %p')}"
+    mins = dt.strftime("%M")
+    ampm = dt.strftime("%p")
+    if mins == "00":
+        return f"{hour} {ampm}"
+    return f"{hour}:{mins} {ampm}"
 
 
 def _fmt_date(date_str: str) -> str:
@@ -98,11 +102,77 @@ def _intent_to_context(intent: dict) -> str:
     return ",".join(parts)
 
 
-# â”€â”€ Step 0: zero-token fast intent detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def _apply_context_carryover(intent: dict, prev_context: str, user_message: str = "") -> dict:
+    """
+    Null-coalescing context: if the LLM returned null for a field, use the
+    value from the previous turn.  If the LLM returned a non-null value the
+    user explicitly stated something new, so LLM wins.
+
+    This is simpler and more robust than word-detection heuristics.
+    Only fires for slot-finding actions.
+    """
+    if not prev_context:
+        return intent
+    action = intent.get("action", "unknown")
+    if action not in ("find_slot", "check_availability", "book_explicit"):
+        return intent
+
+    prev: dict = {}
+    for part in prev_context.split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            prev[k.strip()] = v.strip()
+
+    # DATE — LLM null → use prev
+    if not intent.get("date") and not intent.get("date_range"):
+        if "date" in prev:
+            intent["date"] = prev["date"]
+            log.debug("[carryover] date ← prev: %s", prev["date"])
+        elif "range" in prev:
+            halves = prev["range"].split(" to ", 1)
+            if len(halves) == 2:
+                intent["date_range"] = {"start": halves[0], "end": halves[1]}
+                log.debug("[carryover] date_range ← prev: %s", prev["range"])
+
+    # DURATION — LLM null → use prev
+    if not intent.get("duration_minutes") and "duration_minutes" in prev:
+        try:
+            intent["duration_minutes"] = int(prev["duration_minutes"])
+            log.debug("[carryover] duration ← prev: %s min", prev["duration_minutes"])
+        except ValueError:
+            pass
+
+    # TIME — LLM null → use prev (user established a specific start time earlier)
+    # Clear any conflicting not_before/not_after — an exact time supersedes them.
+    if not intent.get("time") and "time" in prev:
+        intent["time"] = prev["time"]
+        log.debug("[carryover] time ← prev: %s", prev["time"])
+
+    # TITLE — LLM null → use prev
+    if not intent.get("title") and "title" in prev:
+        intent["title"] = prev["title"]
+
+    # CONSTRAINTS — fill only the null slots from prev.
+    # Skip not_before/not_after if an exact time was carried (they would conflict).
+    constraints = intent.get("constraints") or {}
+    if not intent.get("time"):
+        if not constraints.get("not_before") and "not_before" in prev:
+            constraints["not_before"] = prev["not_before"]
+            log.debug("[carryover] not_before ← prev: %s", prev["not_before"])
+        if not constraints.get("not_after") and "not_after" in prev:
+            constraints["not_after"] = prev["not_after"]
+            log.debug("[carryover] not_after ← prev: %s", prev["not_after"])
+    intent["constraints"] = constraints
+
+    return intent
+
+
+#Step 0: zero-token fast intent detection 
 
 _CONFIRM_WORDS = {
     "yes", "yeah", "yep", "sure", "ok", "okay", "go ahead",
     "confirm", "book it", "do it", "yup", "absolutely", "schedule it",
+    "ye", "ya", "yea", "aye", "sounds good", "let's do it", "go for it",
 }
 _CANCEL_WORDS = {
     "no", "nope", "cancel", "stop", "never mind", "nevermind",
@@ -120,30 +190,7 @@ def _fast_intent(user_message: str) -> str | None:
     return None
 
 
-def _last_weekday_of_month(tz_name: str) -> str:
-    """Return YYYY-MM-DD of the last Mon–Fri of the current month."""
-    tz = ZoneInfo(tz_name)
-    today = datetime.now(tz).date()
-    if today.month == 12:
-        last_day = _date(today.year + 1, 1, 1) - timedelta(days=1)
-    else:
-        last_day = _date(today.year, today.month + 1, 1) - timedelta(days=1)
-    while last_day.weekday() >= 5:  # 5=Sat, 6=Sun
-        last_day -= timedelta(days=1)
-    return last_day.strftime("%Y-%m-%d")
 
-
-def _preprocess_message(msg: str, tz_name: str) -> str:
-    """Replace known date expressions with concrete dates before calling the LLM."""
-    import re as _re
-    if _re.search(r"last\s+weekday\s+of\s+(this|the)\s+month", msg, _re.IGNORECASE):
-        concrete = _last_weekday_of_month(tz_name)
-        msg = _re.sub(
-            r"last\s+weekday\s+of\s+(this|the)\s+month",
-            concrete, msg, flags=_re.IGNORECASE,
-        )
-        log.debug("[preprocess] last weekday of month → %s", concrete)
-    return msg
 
 
 # â”€â”€ Step 2: deterministic router (zero LLM tokens) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -201,7 +248,7 @@ def _route(
     if action == "book_explicit" and not intent.get("time") and not intent.get("date_range"):
         action = "find_slot"
 
-    # â”€â”€ CONFIRM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     if action == "confirm":
         pending = slot_cache.get("_pending")
         if not pending:
@@ -281,9 +328,12 @@ def _route(
         duration = int(intent.get("duration_minutes") or 60)
         title = intent.get("title") or "Meeting"
         date_label = _fmt_date(date)
+        constraints = intent.get("constraints") or {}
+        not_before = constraints.get("not_before")
+        not_after  = constraints.get("not_after")
 
         if not specific_time:
-            # General availability query \u2014 list free windows
+            # General availability query — list free windows
             _t = time.perf_counter()
             try:
                 windows = get_availability(creds, date, tz_name, slot_cache)
@@ -292,11 +342,46 @@ def _route(
                 return f"Couldn't check calendar: {exc}"
             if not windows:
                 return f"You're fully booked on {date_label}."
+            # Filter by time-of-day constraints (e.g. "afternoon" → not_before=12:00)
+            tz = ZoneInfo(tz_name)
+            def _parse_hhmm(hhmm: str) -> datetime | None:
+                try:
+                    h, m = hhmm.split(":")
+                    d = datetime.strptime(date, "%Y-%m-%d").replace(
+                        hour=int(h), minute=int(m), tzinfo=tz)
+                    return d
+                except Exception:
+                    return None
+            nb_dt = _parse_hhmm(not_before) if not_before else None
+            na_dt = _parse_hhmm(not_after)  if not_after  else None
+            if nb_dt or na_dt:
+                filtered = []
+                for w in windows:
+                    w_from = datetime.fromisoformat(w["from"])
+                    w_to   = datetime.fromisoformat(w["to"])
+                    if nb_dt and w_to   <= nb_dt: continue
+                    if na_dt and w_from >= na_dt: continue
+                    # Clip window to the constraint range
+                    clipped_from = max(w_from, nb_dt) if nb_dt else w_from
+                    clipped_to   = min(w_to,   na_dt) if na_dt else w_to
+                    if clipped_to > clipped_from:
+                        filtered.append({"from": clipped_from.isoformat(),
+                                         "to":   clipped_to.isoformat()})
+                windows = filtered or windows  # fall back to all windows if filter removes everything
             fitting = [
                 w for w in windows
                 if (datetime.fromisoformat(w["to"]) - datetime.fromisoformat(w["from"])).seconds >= duration * 60
             ]
-            return f"On {date_label} you're free: {_fmt_windows(fitting or windows)}."
+            # Format: avoid showing midnight as the endpoint — cap display at 10 PM
+            def _display_window(w: dict) -> str:
+                s = datetime.fromisoformat(w["from"])
+                e = datetime.fromisoformat(w["to"])
+                # If window runs to end-of-day midnight, show a readable end-of-workday cap
+                e_naive_hour = e.hour
+                e_display = "10 PM" if e_naive_hour == 0 and e.date() > s.date() else _fmt_time(e)
+                return f"{_fmt_time(s)}–{e_display}"
+            window_strs = ", ".join(_display_window(w) for w in (fitting or windows)[:4])
+            return f"On {date_label} you're free: {window_strs}."
 
         # Specific time — verify availability then set pending confirmation
         try:
@@ -332,6 +417,8 @@ def _route(
                 "title": title, "start_iso": start_iso,
                 "end_iso": end_iso, "timezone": tz_name, "display": display,
             }
+            if action == "check_availability":
+                return f"{_fmt_time(s_dt)}\u2013{_fmt_time(e_dt)} is free on {date_label}. Want me to book it as **{title}**?"
             return f"Booking **{title}** on {display}. Shall I go ahead?"
         else:
             conflict = result.get("conflict", {})
@@ -374,6 +461,7 @@ def _route(
                 datetime.strptime(anchor_search_start, "%Y-%m-%d") + timedelta(days=14)
             ).strftime("%Y-%m-%d")
             _t = time.perf_counter()
+            anchor_resolved = False
             try:
                 anc = search_event(creds, anchor, anchor_search_start, anchor_search_end, tz_name)
                 timing["tools"].append({"name": "search_event(anchor)", "ms": round((time.perf_counter() - _t) * 1000)})
@@ -381,6 +469,7 @@ def _route(
                 if anc_events:
                     ae = anc_events[0]
                     ae_date = ae["date"]
+                    anchor_resolved = True
                     if anchor_offset_days:
                         # e.g. "a day or two after Project Alpha" → shift search date
                         new_start = (
@@ -407,8 +496,13 @@ def _route(
                                   anchor,
                                   "not_after" if anchor_relation == "before" else "not_before",
                                   not_after or not_before, buffer_minutes)
+                else:
+                    # Event not found in calendar — can't apply constraint
+                    return f"I couldn't find '{anchor}' on your calendar. Could you check the event name or date?"
             except Exception as exc:
                 log.warning("[router] anchor search failed: %s", exc)
+                # Network/API error — can't safely proceed without the time constraint
+                return f"I couldn't look up '{anchor}' right now (calendar error). Try again in a moment."
 
         # Apply default working-hours floor AFTER anchor resolution
         # (so anchor end-time isn't overwritten by "08:00" default)
@@ -472,16 +566,14 @@ def _fallback_reply(user_message: str, model: str, timing: dict) -> str:
             model=model,
             messages=[
                 {"role": "system", "content": (
-                    "You are a scheduling assistant. You can ONLY check calendar availability, "
-                    "find free slots, and book meetings. "
-                    "You CANNOT send reminders, emails, notifications, or do anything else. "
-                    "If asked to do something outside scheduling, politely say you can only help with scheduling. "
-                    "Reply in 1-2 sentences."
+                    "You are a voice scheduling assistant. "
+                    "You can ONLY check availability and book meetings. "
+                    "Reply in one short sentence, 10 words max."
                 )},
                 {"role": "user", "content": user_message},
             ],
             temperature=0.2,
-            max_tokens=80,
+            max_tokens=40,
         )
         timing["groq_calls"].append({"iter": "fallback", "ms": round((time.perf_counter() - _t) * 1000)})
         return resp.choices[0].message.content or "I didn't understand that. Could you rephrase?"
@@ -493,14 +585,13 @@ def _fallback_reply(user_message: str, model: str, timing: dict) -> str:
 
 def run_agent(
     user_message: str,
-    history: list[dict],
     credentials: Credentials,
     user_timezone: str = "UTC",
     slot_cache: dict | None = None,
-) -> tuple[str, list[dict], dict]:
+) -> tuple[str, dict]:
     """
     Run one conversational turn of the scheduling agent.
-    Returns: (reply, updated_history, timing)
+    Returns: (reply, timing)
     """
     t_agent = time.perf_counter()
     timing: dict = {"groq_calls": [], "tools": [], "total_ms": 0}
@@ -516,21 +607,20 @@ def run_agent(
         log.info("[agent] fast intent: %s", fast)
     else:
         # Step 1: LLM intent extraction (~150 tokens)
-        preprocessed = _preprocess_message(user_message, user_timezone)
         prev_context = slot_cache.get("_last_context", "")
         _t = time.perf_counter()
         try:
-            intent = extract_intent(preprocessed, user_timezone, prev_context, model=model)
+            intent = extract_intent(user_message, user_timezone, prev_context, model=model)
         except RateLimitError:
             log.warning("[agent] rate limit on intent extraction, retrying with %s", MODEL_FALLBACK)
             try:
-                intent = extract_intent(preprocessed, user_timezone, prev_context, model=MODEL_FALLBACK)
+                intent = extract_intent(user_message, user_timezone, prev_context, model=MODEL_FALLBACK)
                 model = MODEL_FALLBACK
             except (RateLimitError, Exception):
                 timing["total_ms"] = round((time.perf_counter() - t_agent) * 1000)
                 return (
                     "I'm being rate limited right now. Please try again in a moment.",
-                    history, timing,
+                    timing,
                 )
         except Exception as exc:
             log.error("[agent] intent extraction failed: %s", exc)
@@ -539,23 +629,29 @@ def run_agent(
         timing["groq_calls"].append({"iter": 0, "ms": groq_ms})
         log.info("[agent] intent=%s (%.0fms)", json.dumps(intent)[:150], groq_ms)
 
-    # Persist compact context for next turn's intent call (multi-turn carry-over)
-    slot_cache["_last_context"] = _intent_to_context(intent)
+    # For refinement turns, fill null fields from prev turn's context
+    if not fast:
+        intent = _apply_context_carryover(intent, prev_context)
+
+    # Persist compact context for next turn's intent call (multi-turn carry-over).
+    # Skip on confirm/cancel — those are meta-actions that carry no new scheduling
+    # context, so we preserve whatever date/duration was already established.
+    # This prevents VAD-split speech ("No." then "check 1 PM") from losing the date.
+    if intent.get("action") not in ("confirm", "cancel"):
+        slot_cache["_last_context"] = _intent_to_context(intent)
 
     # Step 2: Python deterministic routing (0 LLM tokens)
     reply = _route(intent, credentials, slot_cache, user_timezone, today, timing)
 
     # Step 3: NL fallback only for unknown intent (~80 tokens)
     if reply is None:
-        reply = _fallback_reply(user_message, model, timing)
+        pending = slot_cache.get("_pending")
+        if pending:
+            reply = f"Did you want to confirm booking **{pending['title']}** at {pending['display']}?"
+        else:
+            reply = _fallback_reply(user_message, model, timing)
 
     timing["total_ms"] = round((time.perf_counter() - t_agent) * 1000)
     log.debug("[timing] run_agent total=%dms", timing["total_ms"])
     log.info("[agent] reply: %s", reply[:120])
-
-    updated_history = [
-        *history,
-        {"role": "user", "content": user_message},
-        {"role": "assistant", "content": reply},
-    ]
-    return reply, updated_history, timing
+    return reply, timing

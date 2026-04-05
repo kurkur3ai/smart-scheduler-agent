@@ -28,9 +28,24 @@ Smart Scheduler is a FastAPI backend + single-page frontend that gives users a n
 - Book a meeting with a two-step confirm flow
 - List all events on a given day
 - Search for specific events by name
-- Handle relative scheduling ("after my standup", "next Tuesday morning")
+- Handle relative scheduling ("after my standup", "last weekday of next month", "end of next quarter")
 
-In production, the UI switches to a **voice mode** — users speak their request, it is transcribed by Groq Whisper, processed by the agent, and the reply is spoken back using Groq TTS.
+In **development**, the UI shows a standard text chat interface. In **production**, the entire interface becomes voice-driven — no typing required. The user speaks, the browser detects when they stop talking, the audio is transcribed, the agent replies, and the reply is spoken back.
+
+### What a conversation looks like
+
+```
+User:  Find me a free hour on the last weekday of next month.
+Agent: Found a 60 min slot: Friday, May 29 at 10 AM–11 AM. Shall I book it as Meeting?
+
+User:  Actually make it a standup, 30 minutes.
+Agent: Found a 30 min slot: Friday, May 29 at 10 AM–10:30 AM. Shall I book it as Standup?
+
+User:  Yes.
+Agent: Done! Standup is on your calendar for Friday, May 29 at 10 AM–10:30 AM.
+```
+
+The agent remembers `date`, `time`, `duration`, and `title` across turns — "actually make it 30 minutes" works without repeating the date.
 
 ---
 
@@ -53,30 +68,50 @@ Browser
   │                                              └─► agent.run_agent()
   │                                                    │
   │                                                    ├─ Step 0: _fast_intent()
-  │                                                    │   (zero LLM — set lookup for
-  │                                                    │    obvious confirm/cancel words)
+  │                                                    │   zero LLM — word-set lookup
+  │                                                    │   for confirm / cancel
   │                                                    │
   │                                                    ├─ Step 1: intent.extract_intent()
-  │                                                    │   LLM: llama-3.3-70b-versatile
-  │                                                    │   ~150 input tokens → JSON intent
+  │                                                    │   LLM: llama-3.1-8b-instant
+  │                                                    │   input: today, tomorrow, prev
+  │                                                    │   context, schema, message
+  │                                                    │
+  │                                                    │   [simple date] → JSON intent
+  │                                                    │
+  │                                                    │   [relative date, e.g. "last
+  │                                                    │    weekday of next month"]:
+  │                                                    │   LLM calls get_date_map tool
+  │                                                    │        ↓
+  │                                                    │   Python returns date map
+  │                                                    │        ↓
+  │                                                    │   LLM reads map → JSON intent
   │                                                    │
   │                                                    └─ Step 2: _route()
-  │                                                        (zero LLM — Python router)
+  │                                                        zero LLM — Python router
   │                                                        │
-  │                                                        ├─ check_availability
-  │                                                        ├─ find_next_slot / find_slot_in_range
+  │                                                        ├─ find_next_slot
+  │                                                        ├─ find_slot_in_range
   │                                                        ├─ check_slot + set _pending
   │                                                        ├─ book_slot (on confirm)
   │                                                        ├─ get_events_for_day
-  │                                                        └─ search_event
+  │                                                        ├─ search_event (incl. anchor)
+  │                                                        └─ get_availability
   │                                                              │
   │                                                              └─► Google Calendar API
   │
-  ├─[POST /voice/transcribe]─────────────────► voice.py → Groq Whisper (STT)
-  │      body: audio file (webm/wav/mp4)
+  │  ── Voice pipeline (production only) ──────────────────────────────────────────
   │
-  └─[POST /voice/synthesize]─────────────────► voice.py → Groq TTS / Orpheus (TTS)
+  │  [Browser VAD loop — entirely client-side]
+  │  @ricky0123/vad-web + onnxruntime-web (WASM)
+  │  Silero model detects speech → emits WAV segment
+  │        │
+  ├─[POST /voice/transcribe]─────────────────► voice.py → Groq Whisper STT
+  │      body: WAV blob                          returns: {"text": "..."}
+  │                                              (browser then calls /chat with the text)
+  │
+  └─[POST /voice/synthesize]─────────────────► voice.py → Groq Orpheus TTS
          body: {text}                             returns: audio/wav bytes
+                                                  (browser plays via AudioContext)
 ```
 
 ### Two-step Scheduling Pipeline — Token Efficiency
@@ -84,10 +119,12 @@ Browser
 | Step | LLM calls | Approx. tokens |
 |---|---|---|
 | Step 0: fast intent (set lookup) | 0 | 0 |
-| Step 1: intent extraction | 1 (70b model) | ~150 in / ~100 out |
+| Step 1: intent extraction — simple date | 1 (`8b` model) | ~150 in / ~100 out |
+| Step 1: intent extraction — complex relative date | 2 (`8b` model) | ~150 + map + ~100 out |
 | Step 2: routing + calendar ops | 0 | 0 |
 | Step 3: NL fallback (unknown intent only) | 0 or 1 | ~80 out |
-| **Typical turn (known intent)** | **1** | **~250** |
+| **Typical turn (known intent, simple date)** | **1** | **~250** |
+| **Turn with relative date** | **2** | **~500** |
 | **Worst case (unknown intent)** | **2** | **~330** |
 | Old tool-calling approach | 2–3 | ~4,000–7,200 |
 
@@ -98,12 +135,11 @@ Browser
 ```
 smart-scheduler/
 ├── backend/
-│   ├── main.py           # FastAPI app, OAuth flow, /chat, /voice endpoints
+│   ├── main.py           # FastAPI app, OAuth flow, /chat, /voice, /session endpoints
 │   ├── agent.py          # 2-step pipeline: fast-intent → extract → route → calendar
-│   ├── intent.py         # LLM intent extraction (Step 1, minimal prompt ~150 tokens)
+│   ├── intent.py         # LLM intent extraction with get_date_map tool for relative dates
 │   ├── calendar_tool.py  # Google Calendar API helpers (stateless, creds-injected)
 │   ├── voice.py          # STT (Groq Whisper) + TTS (Groq Orpheus)
-│   ├── memory.py         # Conversation state management (placeholder)
 │   └── prompts.py        # Prompt constants (placeholder, pipeline moved to intent.py)
 ├── frontend/
 │   └── index.html        # Single-page UI — text mode (dev) or voice mode (prod)
@@ -132,22 +168,96 @@ smart-scheduler/
 
 ### Multi-turn Context
 
-The agent carries key fields (`title`, `date`, `duration_minutes`, time constraints) across turns so follow-up messages like "make it 45 minutes instead" work without repeating everything.
+The agent carries key fields across turns — `title`, `date`, `duration_minutes`, `time`, `not_before`, `not_after` — so follow-up messages work without the user repeating context.
+
+The rule is **null-coalescing**: if the LLM returned `null` for a field, the previous turn's value wins. If the LLM returned a non-null value, the new value wins (user said something new).
+
+An exact `time` value (e.g. `14:00`) takes precedence over `not_before`/`not_after` constraints from a previous turn — they would conflict, so the constraints are dropped when an explicit time is carried forward.
+
+**Example:**
+```
+Turn 1: "Find a slot Friday afternoon"
+  → intent: date=2026-04-10, not_before=12:00, duration=60
+  → "Found 60 min: Friday at 1 PM–2 PM. Book as Meeting?"
+
+Turn 2: "Change duration to 90 minutes"
+  → LLM returns: duration=90, date=null, not_before=null
+  → carryover fills: date=2026-04-10, not_before=12:00
+  → "Found 90 min: Friday at 1 PM–2:30 PM. Book as Meeting?"
+
+Turn 3: "Make it 2 PM"
+  → LLM returns: time=14:00, date=null, duration=null
+  → carryover fills: date=2026-04-10, duration=90
+  → not_before dropped (explicit time supersedes)
+  → "Booking Meeting on Friday at 2 PM–3:30 PM. Shall I go ahead?"
+```
+
+### Session Reset
+
+A **↻ New Conversation** button in the UI calls `POST /session/reset`, which clears the slot cache and conversation context for the current session without affecting Google authentication. The user can start a fresh scheduling conversation without a full page reload.
 
 ### Scheduling Constraints
 
-- `not_before` / `not_after` — time window bounds ("before 6 PM", "after noon")
-- `exclude_days` — skip specified weekdays in a date range search
-- `anchor_event` + `anchor_relation` — schedule relative to an existing calendar event
-- `anchor_offset_days` — schedule N days after a named event
-- `buffer_minutes` — add buffer after an anchor event end time
+- `not_before` / `not_after` — time window bounds ("before 6 PM", "after noon", "morning", "afternoon")
+- `exclude_days` — skip specific weekdays across a date range ("next week, no Mondays or Fridays")
+- `anchor_event` + `anchor_relation` — schedule relative to an existing calendar event ("after my standup", "before the all-hands")
+- `anchor_offset_days` — schedule a given number of days after a named event ("a day or two after the kickoff")
+- `buffer_minutes` — add a buffer gap after the anchor event ends before placing the new meeting
+
+When an anchor event is referenced, the router calls `search_event()` to find it on the calendar before computing the time constraint. If the event is not found or a network error occurs, the agent replies with a clear error rather than silently scheduling at the wrong time.
+
+### Confirmation Flow
+
+No meeting is ever booked in a single step. The agent always:
+1. Proposes a slot ("Found 60 min: Friday at 10 AM–11 AM. Shall I book it as Meeting?")
+2. Waits for an explicit confirm ("yes", "go ahead", "book it", "sounds good", etc.)
+3. Only then calls `book_slot()` against the Google Calendar API
+
+The pending slot is stored in the session's `_slot_cache` under `_pending`. Saying "no", "cancel", or "never mind" clears it. If the user says something ambiguous after a proposal, the agent reminds them of the pending booking rather than starting over.
 
 ### Voice Mode (Production)
 
-- **STT**: Groq Whisper `whisper-large-v3-turbo` transcribes browser-recorded audio (webm / mp4 / wav)
-- **TTS**: Groq Orpheus `canopylabs/orpheus-v1-english` (`troy` voice) synthesizes the agent reply as WAV
-- Markdown stripped from TTS input so it doesn't read "asterisk" or "bullet point" aloud
-- Time range dashes reformatted as "X to Y" for natural speech
+#### Why vad-web instead of LiveKit (or any server-side voice framework)?
+
+The obvious choice for a voice assistant is a server-side media framework like LiveKit, which streams audio from the browser to a server process that runs a VAD model, performs STT, and streams TTS back. That works well on hardware where memory is not a constraint.
+
+This project targets **Render's free tier** — 512 MB of RAM for the entire Python process. A server-side VAD model (Silero via PyTorch) would consume ~300–400 MB on its own, leaving no headroom for FastAPI, the Groq client, or Google Calendar calls. LiveKit itself also requires a separate relay/SFU server.
+
+The solution: move VAD entirely into the browser. `@ricky0123/vad-web` runs the same Silero ONNX model client-side via `onnxruntime-web` (WebAssembly). The server never sees a raw audio stream — it only receives a finished WAV segment after the browser has already detected that the user stopped speaking. This means:
+
+- **Zero server RAM** for voice activity detection
+- **No persistent connection** — each speech segment is a standard HTTP POST
+- **Works on free hosting** — the Python process stays well within 512 MB
+- **No LiveKit relay server** needed — the browser handles the real-time audio entirely
+
+The trade-off: the browser needs to load a ~1.5 MB WASM binary and the Silero ONNX model (~1 MB) on first load. This is a one-time cost and acceptable for a scheduling assistant.
+
+#### How browser-side VAD works
+
+1. User clicks **🎤 Start** → `AudioContext` is created (browser requires a user gesture before any audio API). This same context is reused for TTS playback.
+2. `MicVAD` from `@ricky0123/vad-web` opens the microphone and continuously feeds audio frames to the Silero model running in WASM.
+3. When the model detects speech onset → button turns red / **🔴 Hearing…**
+4. When the model detects speech end (configurable silence threshold) → `onSpeechEnd` fires with a `Float32Array` of PCM audio.
+5. The browser converts the PCM to a WAV blob and POSTs it to `/voice/transcribe`.
+6. The transcript is passed to `/chat` for the agent pipeline.
+7. The agent reply text is POSTed to `/voice/synthesize` → WAV bytes played via `AudioContext.decodeAudioData()`.
+
+#### Key VAD configuration
+
+| Parameter | Value | Effect |
+|---|---|---|
+| `positiveSpeechThreshold` | `0.6` | Confidence needed to declare speech started |
+| `negativeSpeechThreshold` | `0.35` | Confidence below which silence is declared |
+| `minSpeechFrames` | `4` | Minimum frames to count as speech (filters clicks/coughs) |
+| ORT `numThreads` | `1` | Single WASM thread — avoids SharedArrayBuffer requirement on some hosts |
+| ORT `logLevel` | `error` | Suppresses the Silero model's verbose optimization logs |
+
+#### TTS reliability
+
+- The Groq TTS endpoint occasionally drops connections under brief server load spikes. `speak_text()` retries up to 3 times with 0.5 s and 1.0 s back-off before failing.
+- HTTP 4xx responses (bad input, quota) fail immediately without retrying.
+- Markdown is stripped before synthesis so the TTS doesn't read "asterisk" or "hash" aloud.
+- Time ranges like "9 AM–10 AM" are rewritten to "9 AM to 10 AM" for natural-sounding speech.
 
 ### Security
 
@@ -171,9 +281,25 @@ Standard LLM tool-calling sends the full conversation history plus tool schemas 
 
 This cuts cost and latency by ~10–20x per turn and makes the calendar logic deterministic and testable.
 
+### Why the `get_date_map` tool for relative dates?
+
+Early versions tried to resolve relative date phrases ("last weekday of next week") in Python using regex rules before the LLM ever saw them. This broke in two ways: regex can't enumerate every phrase a user might say, and adding a new phrasing required editing code.
+
+The current design inverts responsibility:
+- Python handles what it's good at: arithmetic (given a range, return every date with its label)
+- The LLM handles what it's good at: understanding natural language ("second Tuesday", "last weekday", "end of next quarter")
+
+The `get_date_map` tool takes an optional `start` and `end` date and returns `{"YYYY-MM-DD": "Weekday D Mon YYYY"}` for every day in the range. The LLM reads the map and picks the right date. No new code is needed when a user says something unexpected — the LLM just requests an appropriate range and reads it.
+
+For simple turns ("tomorrow", "Friday") the LLM resolves the date directly from `today`/`tomorrow` without calling the tool, so there's no latency penalty for the common case.
+
+### Why vad-web instead of LiveKit (or any server-side voice framework)?
+
+See the [Voice Mode](#voice-mode-production) section for the full explanation. Short version: this project targets Render's free tier (512 MB RAM). A server-side VAD+PyTorch stack consumes 300–400 MB minimum — not viable. Running the same Silero model client-side in WebAssembly uses zero server memory and needs no separate relay server.
+
 ### Why Groq?
 
-Groq provides a unified API for LLM inference, Whisper STT, and Orpheus TTS, so the entire AI stack runs through one key and one SDK. The inference speed (low-latency LPU hardware) also helps keep the voice loop responsive.
+Groq provides a unified API for LLM inference, Whisper STT, and Orpheus TTS, so the entire AI stack runs through one key and one SDK. The inference speed (low-latency LPU hardware) also keeps the voice loop responsive — typically under 500 ms for STT + agent + TTS combined.
 
 ### Why server-side sessions?
 
@@ -190,7 +316,7 @@ The LLM is only used for the one thing it does well: mapping natural language to
 
 ### Why a single-file frontend?
 
-The UI is intentionally simple — a chat bubble interface in development, a voice orb in production. Keeping it in one `index.html` avoids a build step, keeps the deployment a single `uvicorn` process, and lets the FastAPI backend serve it directly with `FileResponse`.
+The UI is intentionally simple — a chat bubble interface in development, a voice orb in production. Keeping it in one `index.html` avoids a build step, keeps the deployment a single `uvicorn` process, and lets the FastAPI backend serve it directly with `FileResponse`. It also means voice features ship without a CDN or asset pipeline.
 
 ---
 
@@ -198,11 +324,27 @@ The UI is intentionally simple — a chat bubble interface in development, a voi
 
 ### Step 0 — Fast Intent (zero tokens)
 
-`_fast_intent()` checks if the message is a plain confirm or cancel word ("yes", "ok", "no", "cancel", "forget it", etc.) against a hard-coded word set. No LLM call is made.
+`_fast_intent()` checks the message against two hard-coded word sets — `_CONFIRM_WORDS` and `_CANCEL_WORDS` — before any LLM call is made. Words like "yes", "yep", "ye", "ya", "sounds good", "go for it" all map to `confirm`. "No", "nah", "forget it", "never mind" map to `cancel`. This handles the most common turn type (saying yes or no to a proposal) with zero latency and zero cost.
 
 ### Step 1 — Intent Extraction (`intent.py`)
 
-A minimal prompt (~150 tokens total) is sent to `llama-3.1-8b-instant`. The system prompt is a single sentence. The user message includes only: resolved date context, optional previous-turn context, a compact JSON schema, and the user's message.
+A minimal prompt is sent to `llama-3.1-8b-instant`. The prompt contains only: `today` + `tomorrow` ISO dates, optional previous-turn context (compact `key=val` string), a compact JSON schema, and the user's message.
+
+The LLM is instructed to return `date=null` if the user did not mention a date — this is critical for multi-turn carryover to work correctly (a non-null value from the LLM means the user said something new; `null` means inherit from context).
+
+**Simple date turn — 1 LLM call:**
+```
+Prompt → "Find a slot tomorrow afternoon"  
+LLM   → {"action":"find_slot","date":"2026-04-06","constraints":{"not_before":"12:00"},...}
+```
+
+**Relative date turn — 2 LLM calls (1 tool call in between):**
+```
+Prompt  → "Last weekday of next month"
+LLM     → calls get_date_map({"start":"2026-05-01","end":"2026-05-31"})
+Python  → {"2026-05-01":"Friday 1 May 2026", ..., "2026-05-29":"Friday 29 May 2026", ...}
+LLM     → {"action":"find_slot","date":"2026-05-29",...}
+```
 
 The LLM returns a structured intent object:
 
@@ -226,7 +368,7 @@ The LLM returns a structured intent object:
 }
 ```
 
-Date references (today, tomorrow, named weekdays, "next week", "this week") are resolved to concrete ISO dates **before** the LLM call. Period words ("morning", "afternoon", "evening") map to `not_before` constraints rather than a literal `time` value.
+Period words ("morning", "afternoon", "evening") map to `not_before` constraints rather than a literal `time` value. `time` is reserved for exact start times like "at 2 PM".
 
 ### Step 2 — Deterministic Router (`agent.py`)
 
@@ -242,7 +384,7 @@ Zero LLM calls. The router executes Python calendar operations based on the inte
 
 ### Step 3 — NL Fallback (unknown intent only)
 
-If the router returns `None` (intent was `"unknown"`), a second LLM call is made — ~80 output tokens — using a minimal system prompt that constrains the model to scheduling topics only. This only fires when the request genuinely doesn't map to any scheduling action.
+If the router returns `None` (intent was `"unknown"`), the agent first checks whether there is a pending booking in the session. If so, it reminds the user of it ("Did you want to confirm booking **X** at …?") with no LLM call. Only when there is no pending booking does it make a second LLM call — ~80 output tokens — using a minimal system prompt constrained to scheduling topics.
 
 ### Freebusy Cache
 
@@ -265,6 +407,7 @@ Each session maintains an in-memory `_slot_cache` keyed by `"date:tz_name"` with
 | `GET` | `/test-calendar` | Cookie | List tomorrow's free slots (debug endpoint) |
 | `POST` | `/voice/transcribe` | Cookie | Upload audio file → `{"text": str}` |
 | `POST` | `/voice/synthesize` | Cookie | `{"text": str}` → WAV audio bytes |
+| `POST` | `/session/reset` | Cookie | Clears slot cache and conversation context; preserves Google auth |
 
 ### `POST /chat`
 
@@ -356,14 +499,31 @@ Open `http://localhost:8000` in your browser. Click **Connect Google Calendar**,
 #### Example prompts
 
 ```
+# Basic availability
 "Am I free tomorrow afternoon?"
+"What's on my calendar this Thursday?"
+"Am I free from 1 PM to 2 PM on Friday?"
+
+# Booking with constraints
 "Book a 30-minute call on Friday at 2 PM"
 "Find me a 1-hour slot next Tuesday, not before 9 AM"
-"What's on my calendar this Thursday?"
+"Schedule a meeting next week, skip Mondays"
+"Find a slot before 6 PM on Wednesday"
+
+# Anchor-relative scheduling
 "When is my standup?"
 "Find a slot 1 hour after my standup"
-"Schedule a meeting next week, skip Mondays"
-"Last weekday of this month, find me a free hour"
+"Schedule something the day after the project kickoff"
+"Find a slot before the all-hands on Friday"
+
+# Complex relative dates (handled by get_date_map tool)
+"Last weekday of next month — find me a free hour"
+"Book something on the second Tuesday of May"
+"Find a slot at end of next week"
+"Schedule a 45-minute call in three weeks, afternoon"
+
+# Multi-turn refinement
+"Find a slot Friday afternoon"  →  "Make it 90 minutes"  →  "Change to 2 PM"  →  "Yes"
 ```
 
 ---
@@ -402,6 +562,8 @@ The `ENVIRONMENT=production` value is hardcoded in `render.yaml`. In production:
 | Text-to-speech | Groq Orpheus — `canopylabs/orpheus-v1-english` |
 | Calendar integration | Google Calendar API v3 |
 | Authentication | Google OAuth2 via `google-auth-oauthlib` |
+| Voice activity detection | [`@ricky0123/vad-web`](https://github.com/ricky0123/vad) `0.0.22` — Silero ONNX model, runs in-browser |
+| ONNX runtime (browser) | `onnxruntime-web` `1.14.0` — WASM execution provider for the VAD model |
 | Frontend | Vanilla HTML / CSS / JavaScript (no framework) |
 | Deployment | Render.com (`render.yaml`) |
 | Python version | 3.11+ |

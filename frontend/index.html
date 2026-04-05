@@ -144,22 +144,52 @@
       padding: 10px 14px;
       font-size: 1rem;
       cursor: pointer;
-      transition: background .15s, border-color .15s;
+      transition: background .15s, border-color .15s, box-shadow .15s;
       flex-shrink: 0;
     }
     .btn-mic:hover { background: #e8e8ed; border-color: #bbb; }
-    .btn-mic.recording { background: #ff3b30; border-color: #ff3b30; color: #fff; }
     .btn-mic.blocked  { background: #fff3f3; border-color: #ff3b30; color: #ff3b30; }
+    .btn-mic.paused   { background: #e3f0ff; border-color: #0071e3; color: #0071e3; }
+    /* active = VAD running, waiting for speech */
+    .btn-mic.active   { background: #e8f9ef; border-color: #30d158; color: #1a7a3a; }
+    /* speaking = speech currently detected */
+    .btn-mic.speaking { background: #ff3b30; border-color: #ff3b30; color: #fff;
+                        animation: mic-pulse .7s ease-in-out infinite; }
     .btn-mic:disabled { opacity: .5; cursor: not-allowed; }
 
+    /* ── Voice row (standalone mic section) ─────── */
+    #voice-row {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 0 8px;
+    }
+    #voice-row .btn-mic {
+      padding: 12px 36px;
+      border-radius: 28px;
+      font-size: .98rem;
+      font-weight: 500;
+      min-width: 150px;
+    }
+
+    @keyframes mic-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,59,48,.5); }
+      50%       { box-shadow: 0 0 0 9px rgba(255,59,48,0); }
+    }
+
     #mic-status {
-      font-size: .78rem;
-      min-height: 1.1em;
+      font-size: .82rem;
+      min-height: 1.3em;
       color: #6e6e73;
       text-align: center;
-      padding: 2px 4px;
+      padding: 4px 4px;
+      letter-spacing: .01em;
+      transition: color .2s;
     }
-    #mic-status.error { color: #ff3b30; }
+    #mic-status.active   { color: #1a7a3a; font-weight: 500; }
+    #mic-status.speaking { color: #ff3b30; font-weight: 600; }
+    #mic-status.error    { color: #ff3b30; }
 
     .btn-logout {
       align-self: flex-end;
@@ -172,6 +202,17 @@
       cursor: pointer;
       transition: border-color .15s;
     }
+    .btn-new-convo {
+      background: none;
+      border: 1.5px solid #dadce0;
+      border-radius: 8px;
+      padding: 6px 16px;
+      font-size: .85rem;
+      color: #6e6e73;
+      cursor: pointer;
+      transition: border-color .15s, color .15s;
+    }
+    .btn-new-convo:hover { border-color: #0071e3; color: #0071e3; }
     /* ── Voice UI (production only) ─────────────── */
     #voice-ui {
       display: none;
@@ -233,17 +274,18 @@
       <div class="bubble agent">Hi! I'm your Smart Scheduler. Tell me when you'd like to meet and I'll check your calendar.</div>
     </div>
 
+    <div id="voice-row">
+      <button class="btn-mic" id="mic-btn" onclick="toggleVad()" title="Start voice input">🎤 Start</button>
+      <div id="mic-status">Click 🎤 Start to enable voice input</div>
+    </div>
+
     <div id="input-row">
       <input id="msg-input" type="text" placeholder="e.g. Schedule a 30 min meeting tomorrow afternoon…" autocomplete="off" />
-      <button class="btn-mic" id="mic-btn" onclick="toggleMic()" title="Click to speak">🎤</button>
       <button class="btn-send" id="send-btn" onclick="sendMessage()">Send</button>
     </div>
-    <div id="mic-status"></div>
-
-    <!-- Voice UI placeholder — hidden, mic is now in input row -->
-    <div id="voice-ui" style="display:none"></div>
 
     <button class="btn-logout" onclick="logout()">Disconnect Calendar</button>
+    <button class="btn-new-convo" onclick="newConversation()" title="Clear chat and start fresh">&#8635; New Conversation</button>
 
     <!-- Dev-mode timing panel — rendered by showTiming() -->
     <div id="timing-panel"></div>
@@ -254,10 +296,10 @@
     let appMode = 'development'; // set by /config on load
 
     // ── Dev timing state ───────────────────────────────────────────────────
-    let _micStoppedAt = null;   // Date.now() when recording stopped
-    let _sttMs = null;
-    let _chatTiming = null;     // full timing object from /chat
-    let _ttsMs = null;
+    var _micStoppedAt = null;   // Date.now() when recording stopped
+    var _sttMs = null;
+    var _chatTiming = null;     // full timing object from /chat
+    var _ttsMs = null;
 
     function _resetTiming() {
       _micStoppedAt = null; _sttMs = null; _chatTiming = null; _ttsMs = null;
@@ -330,15 +372,24 @@
     }
 
     function applyMode(mode) {
-      // Mic button is always in the input row; show chat for all modes
       document.getElementById('input-row').style.display    = 'flex';
       document.getElementById('transcript').style.display   = 'flex';
-      document.getElementById('voice-ui').style.display     = 'none';
+      setMicStatus('Click 🎤 Start to enable voice input');
     }
 
     async function logout() {
       await fetch('/auth/logout', { method: 'POST', credentials: 'include' });
       checkAuth();
+    }
+
+    async function newConversation() {
+      await fetch('/session/reset', { method: 'POST', credentials: 'include' });
+      const t = document.getElementById('transcript');
+      t.innerHTML = '<div class="bubble agent">Hi! I\'m your Smart Scheduler. Tell me when you\'d like to meet and I\'ll check your calendar.</div>';
+      _resetTiming();
+      const panel = document.getElementById('timing-panel');
+      if (panel) panel.style.display = 'none';
+      document.getElementById('msg-input').value = '';
     }
 
     function addBubble(role, text) {
@@ -369,7 +420,7 @@
       addBubble('user', text);
       const thinking = addBubble('thinking', 'Thinking…');
 
-      // Reset timing panel for text-only messages (voice flow resets in stopRecording)
+      // Reset timing panel for text-only messages (mic sets _micStoppedAt via VAD)
       if (_micStoppedAt === null) _resetTiming();
       // Hide stale timing
       const panel = document.getElementById('timing-panel');
@@ -402,122 +453,18 @@
     }
 
     // ── Mic status helper (never uses chat bubbles) ────────────────────────
-    function setMicStatus(msg, isError) {
+    // cssClass: 'error' | 'active' | 'speaking' | true (= 'error') | falsy (plain)
+    function setMicStatus(msg, cssClass) {
       const el = document.getElementById('mic-status');
       el.textContent = msg;
-      el.className = isError ? 'error' : '';
+      el.className = cssClass === true ? 'error' : (cssClass || '');
     }
 
-    // ── Voice (mic + TTS) ──────────────────────────────────────────────────
-    let mediaRecorder = null;
-    let audioChunks = [];
-    let isRecording = false;
-
-    async function toggleMic() {
-      if (isRecording) { stopRecording(); } else { await startRecording(); }
-    }
-
-    async function startRecording() {
-      // Reset any previous blocked state so the button is always clickable
-      const btn = document.getElementById('mic-btn');
-      btn.classList.remove('blocked');
-      setMicStatus('Requesting mic…');
-
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setMicStatus('Mic API unavailable — use Chrome or Firefox', true);
-        return;
-      }
-
-      // Check if mic is already blocked before calling getUserMedia
-      if (navigator.permissions) {
-        try {
-          const perm = await navigator.permissions.query({ name: 'microphone' });
-          if (perm.state === 'denied') {
-            btn.classList.add('blocked');
-            setMicStatus('Mic blocked by browser — click 🔒 in the address bar → Microphone → Allow → then refresh', true);
-            return;
-          }
-        } catch { /* permissions API unsupported, proceed */ }
-      }
-
-      let stream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (err) {
-        console.error('[mic] getUserMedia:', err.name, err.message);
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          setMicStatus('Permission denied — click 🔒 in address bar → Site settings → Microphone → Allow → refresh', true);
-        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-          setMicStatus('No mic found — Chrome blocked it. Click 🔒 → Site settings → Microphone → Allow → refresh', true);
-        } else if (err.name === 'NotReadableError') {
-          setMicStatus('Mic in use by another app — close it and try again', true);
-        } else {
-          setMicStatus(`Mic error [${err.name}]: ${err.message}`, true);
-        }
-        return;
-      }
-
-      // Stream acquired — set up recorder
-      try {
-        audioChunks = [];
-        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-          ? 'audio/webm;codecs=opus'
-          : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
-        console.log('[mic] mimeType:', mimeType);
-
-        mediaRecorder = new MediaRecorder(stream, { mimeType });
-        mediaRecorder.ondataavailable = e => {
-          console.log('[mic] data chunk:', e.data.size);
-          if (e.data.size > 0) audioChunks.push(e.data);
-        };
-        mediaRecorder.onerror = e => {
-          console.error('[mic] recorder error:', e.error);
-          setMicStatus(`Recorder error: ${e.error?.message || e}`, true);
-        };
-        mediaRecorder.onstop = async () => {
-          stream.getTracks().forEach(t => t.stop());
-          const totalBytes = audioChunks.reduce((n, c) => n + c.size, 0);
-          console.log('[mic] recording stopped, chunks:', audioChunks.length, 'bytes:', totalBytes);
-          if (totalBytes === 0) {
-            setMicStatus('No audio captured — try holding the button longer', true);
-            return;
-          }
-          const ext = mimeType.includes('mp4') ? 'audio.mp4' : 'audio.webm';
-          const blob = new Blob(audioChunks, { type: mimeType });
-          await handleAudioBlob(blob, ext);
-        };
-
-        // timeslice=250ms ensures data arrives even if recording is short
-        mediaRecorder.start(250);
-        isRecording = true;
-        btn.classList.add('recording');
-        btn.textContent = '⏹';
-        btn.title = 'Click to stop recording';
-        setMicStatus('🔴 Recording… click ⏹ to send');
-      } catch (err) {
-        stream.getTracks().forEach(t => t.stop());
-        console.error('[mic] recorder setup error:', err);
-        setMicStatus(`Recorder setup failed: ${err.message}`, true);
-      }
-    }
-
-    function stopRecording() {
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-      isRecording = false;
-      const stoppedAt = Date.now();  // capture before reset clears state
-      _sttMs = null; _chatTiming = null; _ttsMs = null;  // reset per-request timing
-      _micStoppedAt = stoppedAt;  // keep mic stamp for end-to-end measurement
-      const btn = document.getElementById('mic-btn');
-      btn.classList.remove('recording');
-      btn.textContent = '🎤';
-      btn.title = 'Click to speak';
-      setMicStatus('Processing…');
-    }
-
+    // ── Voice ─────────────────────────────────────────────────────────────
+    // VAD lives in the module script below; toggleVad() is exposed via window.
     async function handleAudioBlob(blob, filename) {
       const btn = document.getElementById('mic-btn');
       btn.disabled = true;
-      btn.textContent = '⏳';
       setMicStatus('Transcribing…');
       try {
         const form = new FormData();
@@ -539,10 +486,13 @@
           setMicStatus("Couldn't hear anything clearly — try again", true);
         }
       } catch (err) {
-        setMicStatus(`Transcription failed: ${err.message}`, true);
+        setMicStatus(`Transcription failed: ${err.message}`, 'error');
       } finally {
         btn.disabled = false;
-        btn.textContent = '🎤';
+        // Restore active appearance if VAD is still running
+        if (window._vadInst && !document.getElementById('mic-btn').classList.contains('paused')) {
+          setMicStatus('🟢 Ready — speak anytime', 'active');
+        }
       }
     }
 
@@ -564,7 +514,7 @@
         if (appMode === 'development') {
           showTiming({ sttMs: _sttMs, chatTiming: _chatTiming, ttsMs: _ttsMs, micToVoiceMs });
         }
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioCtx = (window.getAudioCtx ? window.getAudioCtx() : new (window.AudioContext || window.webkitAudioContext)());
         const decoded = await audioCtx.decodeAudioData(buf);
         const src = audioCtx.createBufferSource();
         src.buffer = decoded;
@@ -580,6 +530,124 @@
       });
       checkAuth();
     });
+  </script>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+  <script>
+    // Pin to wasm-only execution provider BEFORE vad-web loads.
+    // Without this ORT tries the WebGPU/JSEP backend which dynamically imports
+    // ort-wasm-simd-threaded.jsep.mjs — that fetch fails without COOP/COEP headers.
+    ort.env.wasm.numThreads = 1;
+    ort.env.logLevel = 'error';   // suppress [W] initializer pruning noise
+    const _ortCreate = ort.InferenceSession.create.bind(ort.InferenceSession);
+    ort.InferenceSession.create = (model, opts) =>
+      _ortCreate(model, { ...(opts || {}), executionProviders: ['wasm'] });
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.22/dist/bundle.min.js"></script>
+  <script>
+    function float32ToWav(float32Array, sampleRate) {
+      const numSamples = float32Array.length;
+      const buf = new ArrayBuffer(44 + numSamples * 2);
+      const view = new DataView(buf);
+      const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+      writeStr(0, 'RIFF');
+      view.setUint32(4, 36 + numSamples * 2, true);
+      writeStr(8, 'WAVE');
+      writeStr(12, 'fmt ');
+      view.setUint32(16, 16, true);           // subchunk1 size
+      view.setUint16(20, 1, true);            // PCM format
+      view.setUint16(22, 1, true);            // mono
+      view.setUint32(24, sampleRate, true);   // sample rate
+      view.setUint32(28, sampleRate * 2, true); // byte rate
+      view.setUint16(32, 2, true);            // block align
+      view.setUint16(34, 16, true);           // bits per sample
+      writeStr(36, 'data');
+      view.setUint32(40, numSamples * 2, true);
+      let off = 44;
+      for (let i = 0; i < numSamples; i++) {
+        const s = Math.max(-1, Math.min(1, float32Array[i]));
+        view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        off += 2;
+      }
+      return new Blob([buf], { type: 'audio/wav' });
+    }
+
+    // Warm up AudioContext on first user gesture so TTS playback is never blocked
+    window._audioCtx = null;
+    function getAudioCtx() {
+      if (!window._audioCtx || window._audioCtx.state === 'closed') {
+        window._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (window._audioCtx.state === 'suspended') window._audioCtx.resume();
+      return window._audioCtx;
+    }
+    window.getAudioCtx = getAudioCtx;
+
+    window.initVAD = async function () {
+      const btn = document.getElementById('mic-btn');
+      btn.disabled = true;
+      window.setMicStatus('Starting mic…');
+      try {
+        // Warm up AudioContext now (we have a user gesture)
+        getAudioCtx();
+        window._vadInst = await vad.MicVAD.new({
+          positiveSpeechThreshold: 0.6,
+          negativeSpeechThreshold: 0.35,
+          minSpeechFrames: 4,
+          onSpeechStart() {
+            window._micStoppedAt = null;
+            const b = document.getElementById('mic-btn');
+            b.classList.remove('active');
+            b.classList.add('speaking');
+            b.textContent = '🔴 Hearing…';
+            window.setMicStatus('🔴 Got you — listening…', 'speaking');
+          },
+          async onSpeechEnd(float32Array) {
+            window._micStoppedAt = Date.now();
+            const b = document.getElementById('mic-btn');
+            b.classList.remove('speaking');
+            b.classList.add('active');
+            b.textContent = '⏸ Pause';
+            const blob = float32ToWav(float32Array, 16000);
+            await window.handleAudioBlob(blob, 'audio.wav');
+          },
+        });
+        window._vadInst.start();
+        btn.classList.add('active');
+        btn.textContent = '⏸ Pause';
+        btn.title = 'Pause listening';
+        window.setMicStatus('🟢 Ready — speak anytime', 'active');
+      } catch (err) {
+        window.setMicStatus(`Mic failed: ${err.message}`, 'error');
+        btn.classList.add('blocked');
+        btn.textContent = '🎤 Start';
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    window.toggleVad = function () {
+      // First click — VAD not yet created, initialise it
+      if (!window._vadInst) { window.initVAD(); return; }
+      const btn = document.getElementById('mic-btn');
+      if (btn.classList.contains('paused')) {
+        // Resume
+        window._vadInst.start();
+        btn.classList.remove('paused');
+        btn.classList.add('active');
+        btn.textContent = '⏸ Pause';
+        btn.title = 'Pause listening';
+        window.setMicStatus('🟢 Ready — speak anytime', 'active');
+      } else if (!btn.classList.contains('blocked')) {
+        // Pause
+        window._vadInst.pause();
+        btn.classList.remove('active', 'speaking');
+        btn.classList.add('paused');
+        btn.textContent = '▶ Resume';
+        btn.title = 'Resume listening';
+        window.setMicStatus('Mic paused — click Resume to listen again');
+      }
+    };
   </script>
 </body>
 </html>

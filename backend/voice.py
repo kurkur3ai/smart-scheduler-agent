@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import time
 
 import httpx
 from groq import Groq
@@ -64,39 +65,51 @@ def speak_text(text: str) -> bytes:
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY not set")
-    try:
-        # Strip markdown formatting so TTS doesn't speak "asterisk" etc.
-        clean = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)  # bold/italic
-        clean = re.sub(r'_{1,2}(.*?)_{1,2}', r'\1', clean)      # underscore bold/italic
-        clean = re.sub(r'`+.*?`+', '', clean)                      # inline code
-        clean = re.sub(r'^#{1,6}\s*', '', clean, flags=re.MULTILINE)  # headings
-        # Replace time-range dashes/en-dashes with 'to' so TTS reads naturally
-        clean = re.sub(r'(\d{1,2}:\d{2}\s*(?:AM|PM))\s*[\u2013\u2014-]\s*(\d{1,2}:\d{2}\s*(?:AM|PM))', r'\1 to \2', clean)
-        clean = clean.strip()
-        # Orpheus has a 200-character input limit
-        truncated = clean[:200]
-        response = httpx.post(
-            "https://api.groq.com/openai/v1/audio/speech",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "canopylabs/orpheus-v1-english",
-                "voice": "troy",
-                "input": truncated,
-                "response_format": "wav",
-            },
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        audio_bytes = response.content
-        log.info("[voice] synthesized %d chars → %d bytes", len(text), len(audio_bytes))
-        return audio_bytes
-    except httpx.HTTPStatusError as exc:
-        log.error("[voice] tts HTTP error %d: %s", exc.response.status_code, exc.response.text)
-        raise RuntimeError(f"Speech synthesis failed: {exc.response.status_code} {exc.response.text}") from exc
-    except Exception as exc:
-        log.error("[voice] tts error: %s", exc)
-        raise RuntimeError(f"Speech synthesis failed: {exc}") from exc
+    # Strip markdown formatting so TTS doesn't speak "asterisk" etc.
+    clean = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)  # bold/italic
+    clean = re.sub(r'_{1,2}(.*?)_{1,2}', r'\1', clean)      # underscore bold/italic
+    clean = re.sub(r'`+.*?`+', '', clean)                      # inline code
+    clean = re.sub(r'^#{1,6}\s*', '', clean, flags=re.MULTILINE)  # headings
+    # Replace time-range dashes/en-dashes with 'to' so TTS reads naturally
+    # Handles both '9 AM–10 AM' and '9:30 AM–10:30 AM'
+    clean = re.sub(
+        r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*[\u2013\u2014\-]\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM))',
+        r'\1 to \2', clean
+    )
+    clean = clean.strip()
+    # Orpheus has a 200-character input limit
+    truncated = clean[:200]
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = httpx.post(
+                "https://api.groq.com/openai/v1/audio/speech",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "canopylabs/orpheus-v1-english",
+                    "voice": "troy",
+                    "input": truncated,
+                    "response_format": "wav",
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            audio_bytes = response.content
+            log.info("[voice] synthesized %d chars → %d bytes", len(text), len(audio_bytes))
+            return audio_bytes
+        except httpx.HTTPStatusError as exc:
+            log.error("[voice] tts HTTP error %d: %s", exc.response.status_code, exc.response.text)
+            raise RuntimeError(f"Speech synthesis failed: {exc.response.status_code} {exc.response.text}") from exc
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                log.warning("[voice] tts transient error (attempt %d/3), retrying: %s", attempt + 1, exc)
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            break
+    log.error("[voice] tts error: %s", last_exc)
+    raise RuntimeError(f"Speech synthesis failed: {last_exc}") from last_exc
 

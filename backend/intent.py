@@ -1,22 +1,26 @@
 """
 intent.py — Step 1 of the 2-step scheduling pipeline.
 
-LLM is given only:
-  - System: ~10 tokens ("Extract scheduling intent as JSON.")
-  - Dates: ~20 tokens (today, tomorrow, next-week range if relevant)
-  - Prev: ~15 tokens (key fields from last turn, for context carry-over)
-  - Schema: ~70 tokens (compact field list)
-  - User message: ~30-50 tokens
+Normal turn (simple date like "tomorrow" or "Friday"):
+  1 LLM call, ~150 tokens in / ~100 tokens out.
 
-Total input: ~150 tokens.  Output: ~100 tokens of JSON.
-Compare to old tool-calling: ~4000 tokens/turn.
+Turn with a relative date the LLM can't resolve from today/tomorrow alone:
+  LLM calls get_date_map(start?, end?) → Python returns {YYYY-MM-DD: "Weekday D Mon"}
+  LLM reads the map and picks the right date → fills JSON.
+  2 LLM calls total.
+
+Why get_date_map instead of resolve_date(anchor, offset):
+  - LLM reads dates directly — no fixed anchor enum, no abstraction ceiling.
+  - Handles ANY expression: "second Tuesday of next month", "last weekday before
+    the 15th", "three Fridays from now", "the Monday after next", etc.
+  - Adding new phrasings needs zero code changes.
 """
 
 import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as _date
 from zoneinfo import ZoneInfo
 
 from groq import Groq, RateLimitError
@@ -30,10 +34,14 @@ MODEL_FALLBACK = "llama-3.3-70b-versatile"
 _SYSTEM = (
     "Extract scheduling intent as JSON. Output only valid JSON. "
     "IMPORTANT: 'before X' means not_after=X (deadline), NOT time=X. "
-    "'after X' means not_before=X. time= is ONLY for exact start times."
+    "'after X' means not_before=X. time= is ONLY for exact start times. "
+    "CRITICAL: date=null if the user did NOT mention a date, day, or time period — "
+    "never default to today unless the user explicitly said 'today'. "
+    "Use the get_date_map tool whenever the user says something like "
+    "'last weekday of next week', 'end of next month', 'second Tuesday of May', "
+    "or any other date you cannot compute from today/tomorrow alone."
 )
 
-# Compact schema hint
 _SCHEMA = (
     '{"action":"check_availability|find_slot|book_explicit|list_events'
     '|search_event|confirm|cancel|unknown",'
@@ -45,52 +53,103 @@ _SCHEMA = (
     '"anchor_event":str|null,"anchor_relation":"before"|"after"|null,'
     '"anchor_offset_days":int|null,'
     '"buffer_minutes":int|null}'
-    # Examples: "before 6 PM" → not_after=18:00, time=null'
-    # "at 3 PM" → time=15:00, no not_after'
-    # "find me a slot tomorrow morning" → find_slot, not_before=08:00, time=null'
 )
 
+# ── get_date_map tool ─────────────────────────────────────────────────────────
 
-def _build_date_context(tz_name: str, message: str) -> str:
+_GET_DATE_MAP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_date_map",
+        "description": (
+            "Return a map of {YYYY-MM-DD: \'Weekday D Mon YYYY\'} for every date in the "
+            "given range so you can identify the correct date for a relative expression. "
+            "Call this when the user says something like 'last weekday of next week', "
+            "'end of next month', 'second Tuesday of May', or any date you cannot "
+            "determine from today/tomorrow alone. "
+            "Omit start to default to today. Omit end to default to 60 days from start."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start": {
+                    "type": "string",
+                    "description": (
+                        "First date of the range, YYYY-MM-DD. "
+                        "Defaults to today if omitted."
+                    ),
+                },
+                "end": {
+                    "type": "string",
+                    "description": (
+                        "Last date of the range (inclusive), YYYY-MM-DD. "
+                        "Defaults to 60 days after start if omitted. "
+                        "Keep the range as small as needed — the tool returns every day."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_MONTH_NAMES = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+
+
+def _build_date_map(start_str: str | None, end_str: str | None, tz_name: str) -> str:
     """
-    Build a small date-context string (~20-30 tokens) to anchor date references.
-    Avoids sending a full 7-day map — only adds what the message actually needs.
+    Build the date map returned to the LLM.
+
+    Defaults:
+      start → today in user's timezone
+      end   → 60 days after start  (wide enough for 'end of next month',
+               'third Friday of next quarter', etc.)
+
+    Cap: never return more than 90 days to keep token count reasonable.
+    Returns JSON: {"YYYY-MM-DD": "Weekday D Mon YYYY", ...}
     """
     tz = ZoneInfo(tz_name)
     today = datetime.now(tz).date()
-    tomorrow = today + timedelta(days=1)
-    ctx = f"today={today.isoformat()},tomorrow={tomorrow.isoformat()}"
 
-    msg = message.lower()
+    try:
+        start = _date.fromisoformat(start_str) if start_str else today
+    except ValueError:
+        start = today
 
-    # Resolve named weekdays so LLM never has to guess
-    _DAY_NAMES = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
-    for i, name in enumerate(_DAY_NAMES):
-        if name in msg:
-            # "next <day>" → at least 7 days out
-            if f"next {name}" in msg:
-                delta = (i - today.weekday()) % 7 or 7
-            else:
-                # nearest upcoming occurrence (today counts if same day)
-                delta = (i - today.weekday()) % 7
-            ctx += f",{name}={( today + timedelta(days=delta)).isoformat()}"
+    try:
+        end = _date.fromisoformat(end_str) if end_str else start + timedelta(days=60)
+    except ValueError:
+        end = start + timedelta(days=60)
 
-    if "next week" in msg:
-        days_to_monday = (7 - today.weekday()) % 7 or 7
-        nxt_mon = today + timedelta(days=days_to_monday)
-        nxt_fri = nxt_mon + timedelta(days=4)
-        ctx += f",next_week={nxt_mon.isoformat()} to {nxt_fri.isoformat()}"
-    elif "this week" in msg:
-        this_fri = today + timedelta(days=(4 - today.weekday()) % 7)
-        ctx += f",this_week_end={this_fri.isoformat()}"
+    # Safety: start must not be in the past relative to today
+    if start < today:
+        start = today
 
-    return ctx
+    # If end is now before start (e.g. caller gave a past range), extend to +60d
+    if end < start:
+        end = start + timedelta(days=60)
+
+    # Cap range at 90 days to avoid token explosion
+    if (end - start).days > 90:
+        end = start + timedelta(days=90)
+
+    # Build map
+    result: dict[str, str] = {}
+    cur = start
+    while cur <= end:
+        label = f"{_DAY_NAMES[cur.weekday()]} {cur.day} {_MONTH_NAMES[cur.month - 1]} {cur.year}"
+        result[cur.isoformat()] = label
+        cur += timedelta(days=1)
+
+    return json.dumps(result)
 
 
 def _parse_raw(raw: str) -> dict:
-    """Strip fences/comments and extract the first JSON object from LLM output."""
     raw = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-    # Remove JS-style // comments that the model sometimes adds
     raw = re.sub(r"//[^\n]*", "", raw)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
@@ -104,35 +163,80 @@ def extract_intent(
     prev_context: str = "",
     model: str = MODEL,
 ) -> dict:
-    """
-    Call LLM with a minimal prompt (~150 tokens input).
+    tz = ZoneInfo(tz_name)
+    today_str    = datetime.now(tz).date().isoformat()
+    tomorrow_str = (datetime.now(tz).date() + timedelta(days=1)).isoformat()
 
-    prev_context: compact string from previous turn, e.g.
-        "title=Call with John,date=2026-04-03,duration_minutes=60"
-        Keeps multi-turn flow coherent without sending full history.
-    """
-    date_ctx = _build_date_context(tz_name, user_message)
-
-    parts = [f"Dates:{date_ctx}"]
+    parts = [f"Dates:today={today_str},tomorrow={tomorrow_str}"]
     if prev_context:
         parts.append(f"Prev:{prev_context}")
     parts.append(f"Schema:{_SCHEMA}")
     parts.append(f"Message:{user_message}")
     user_content = "\n".join(parts)
 
+    messages: list = [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user",   "content": user_content},
+    ]
+
     raw = "{}"
     try:
-        resp = _client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0,
-            max_tokens=200,
-        )
-        raw = resp.choices[0].message.content or "{}"
-        return _parse_raw(raw)
+        for _ in range(3):  # at most 2 tool calls then final JSON answer
+            resp = _client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=[_GET_DATE_MAP_TOOL],
+                tool_choice="auto",
+                temperature=0,
+                max_tokens=300,
+            )
+            assistant_msg = resp.choices[0].message
+
+            if assistant_msg.tool_calls:
+                # Keep assistant turn with tool_call IDs for correlation
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in assistant_msg.tool_calls
+                    ],
+                })
+                for tc in assistant_msg.tool_calls:
+                    if tc.function.name == "get_date_map":
+                        try:
+                            args      = json.loads(tc.function.arguments)
+                            start_arg = args.get("start")
+                            end_arg   = args.get("end")
+                            result    = _build_date_map(start_arg, end_arg, tz_name)
+                            n_dates   = result.count(":")
+                            log.debug(
+                                "[intent] get_date_map(%s → %s) → %d dates",
+                                start_arg or "today", end_arg or "+60d", n_dates,
+                            )
+                        except Exception as exc:
+                            result = json.dumps({"error": str(exc)})
+                            log.warning("[intent] get_date_map error: %s", exc)
+                        messages.append({
+                            "role":         "tool",
+                            "tool_call_id": tc.id,
+                            "content":      result,
+                        })
+                continue  # send map back, LLM picks date and returns JSON
+
+            # No tool call → final answer, parse and return
+            raw = assistant_msg.content or "{}"
+            return _parse_raw(raw)
+
+        log.warning("[intent] no final answer after tool calls")
+        return {"action": "unknown"}
 
     except json.JSONDecodeError as exc:
         log.warning("Intent JSON parse failed (%s): %r", exc, raw[:200])
