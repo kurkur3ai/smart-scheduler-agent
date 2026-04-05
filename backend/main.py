@@ -17,11 +17,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Cookie, FastAPI, File, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from google.oauth2.credentials import Credentials
 from pydantic import BaseModel
 
-from agent import run_agent
+from agent import run_agent, run_agent_stream
 from calendar_tool import (
     SCOPES,
     credentials_from_flow,
@@ -350,35 +350,26 @@ async def chat(
 
     slot_cache = _slot_cache.setdefault(ss_session, {})
 
-    t_chat = time.monotonic()
-    try:
-        reply, agent_timing = run_agent(
+    # Stream SSE events from the agent generator.
+    # Each event is one of:
+    #   {"token": "…"}                         — streamed token (fallback LLM path only)
+    #   {"reply": "…", "done": true, "timing": {…}}  — final event (all paths)
+    #
+    # Internal Llama calls (intent extraction) are BLOCKING non-streaming calls
+    # inside the generator — they need the full JSON before parsing.  Only the
+    # user-visible fallback reply streams tokens.
+    #
+    # X-Accel-Buffering: no — tells nginx not to buffer the SSE stream.
+    return StreamingResponse(
+        run_agent_stream(
             user_message=body.message,
             credentials=creds,
             user_timezone=body.timezone,
             slot_cache=slot_cache,
-        )
-    except RuntimeError as exc:
-        log.error("[chat] agent error: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=502)
-
-    chat_total_ms = round((time.monotonic() - t_chat) * 1000)
-    log.info("[chat] session=%s... total=%dms", ss_session[:8], chat_total_ms)
-
-    # Log per-step breakdown in dev
-    if _is_dev:
-        msg_tokens = _est_tokens(body.message)
-        log.info("  [tokens] user_message ~%d tokens", msg_tokens)
-        for gc in agent_timing.get("groq_calls", []):
-            log.info("  [timing] LLM call iter=%s: %dms", gc["iter"], gc["ms"])
-        for tc in agent_timing.get("tools", []):
-            log.info("  [timing] tool %-25s: %dms", tc["name"], tc["ms"])
-        log.info("  [timing] agent total: %dms", agent_timing.get("total_ms", 0))
-
-    resp: dict = {"reply": reply}
-    if _is_dev:
-        resp["timing"] = agent_timing
-    return resp
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Voice ──────────────────────────────────────────────────────────────────────
@@ -433,19 +424,25 @@ async def voice_synthesize(
     if not creds:
         return JSONResponse({"error": "Not authenticated."}, status_code=401)
 
-    from voice import speak_text
-    t_tts = time.monotonic()
-    try:
-        audio_bytes = speak_text(body.text)
-    except RuntimeError as exc:
-        log.error("[voice] synthesize error: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=502)
-    tts_ms = round((time.monotonic() - t_tts) * 1000)
-    if _is_dev:
-        log.info("  [timing] TTS synthesize: %dms (%d chars → %d bytes)", tts_ms, len(body.text), len(audio_bytes))
+    from voice import speak_text_iter
 
-    headers = {"X-Timing-Ms": str(tts_ms)} if _is_dev else {}
-    return Response(content=audio_bytes, media_type="audio/wav", headers=headers)
+    # Stream WAV bytes from Orpheus directly to the client without buffering
+    # the entire file in the backend.  The frontend parses the 44-byte WAV
+    # header in the first chunk, then schedules PCM16 blocks onto the Web
+    # Audio API timeline so playback starts before the full file arrives.
+    async def _tts_stream():
+        try:
+            async for chunk in speak_text_iter(body.text):
+                yield chunk
+        except RuntimeError as exc:
+            log.error("[voice] synthesize stream error: %s", exc)
+            # Headers already sent (200 OK); just stop the stream.
+
+    return StreamingResponse(
+        _tts_stream(),
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Session reset ──────────────────────────────────────────────────────────────

@@ -63,18 +63,18 @@ Browser
   │
   ├─[POST /chat]─────────────────────────────► main.py
   │      body: {message, timezone}               │
-  │                                              ├─ Validate session / refresh token
+  │      response: text/event-stream (SSE)       ├─ Validate session / refresh token
   │                                              ├─ Debounce check (1 s)
-  │                                              └─► agent.run_agent()
+  │                                              └─► agent.run_agent_stream()  ← sync generator
   │                                                    │
   │                                                    ├─ Step 0: _fast_intent()
   │                                                    │   zero LLM — word-set lookup
   │                                                    │   for confirm / cancel
   │                                                    │
   │                                                    ├─ Step 1: intent.extract_intent()
-  │                                                    │   LLM: llama-3.1-8b-instant
-  │                                                    │   input: today, tomorrow, prev
-  │                                                    │   context, schema, message
+  │                                                    │   BLOCKING (non-streaming) —
+  │                                                    │   needs full JSON before parsing.
+  │                                                    │   LLM: llama-3.3-70b-versatile
   │                                                    │
   │                                                    │   [simple date] → JSON intent
   │                                                    │
@@ -86,18 +86,26 @@ Browser
   │                                                    │        ↓
   │                                                    │   LLM reads map → JSON intent
   │                                                    │
-  │                                                    └─ Step 2: _route()
-  │                                                        zero LLM — Python router
-  │                                                        │
-  │                                                        ├─ find_next_slot
-  │                                                        ├─ find_slot_in_range
-  │                                                        ├─ check_slot + set _pending
-  │                                                        ├─ book_slot (on confirm)
-  │                                                        ├─ get_events_for_day
-  │                                                        ├─ search_event (incl. anchor)
-  │                                                        └─ get_availability
-  │                                                              │
-  │                                                              └─► Google Calendar API
+  │                                                    ├─ Step 2: _route()
+  │                                                    │   zero LLM — Python router
+  │                                                    │   → yields SSE done event
+  │                                                    │     immediately (most turns)
+  │                                                    │
+  │                                                    │   ├─ find_next_slot
+  │                                                    │   ├─ find_slot_in_range
+  │                                                    │   ├─ check_slot + set _pending
+  │                                                    │   ├─ book_slot (on confirm)
+  │                                                    │   ├─ get_events_for_day
+  │                                                    │   ├─ search_event (incl. anchor)
+  │                                                    │   └─ get_availability
+  │                                                    │         │
+  │                                                    │         └─► Google Calendar API
+  │                                                    │
+  │                                                    └─ Step 3: NL fallback (unknown only)
+  │                                                        stream=True — yields token
+  │                                                        events word-by-word as the
+  │                                                        LLM produces them, then a
+  │                                                        final done event
   │
   │  ── Voice pipeline (production only) ──────────────────────────────────────────
   │
@@ -110,8 +118,11 @@ Browser
   │                                              (browser then calls /chat with the text)
   │
   └─[POST /voice/synthesize]─────────────────► voice.py → Groq Orpheus TTS
-         body: {text}                             returns: audio/wav bytes
-                                                  (browser plays via AudioContext)
+         body: {text}                             returns: audio/wav bytes (streamed)
+                                                  backend pipes chunks without buffering
+                                                  browser schedules PCM blocks on the
+                                                  Web Audio timeline progressively —
+                                                  playback starts before full file arrives
 ```
 
 ### Two-step Scheduling Pipeline — Token Efficiency
@@ -254,7 +265,8 @@ The trade-off: the browser needs to load a ~1.5 MB WASM binary and the Silero ON
 
 #### TTS reliability
 
-- The Groq TTS endpoint occasionally drops connections under brief server load spikes. `speak_text()` retries up to 3 times with 0.5 s and 1.0 s back-off before failing.
+- The streaming TTS path (`speak_text_iter`) pipes Orpheus WAV bytes directly to the browser via `httpx.AsyncClient.stream()` — no buffering on the backend.
+- The non-streaming fallback (`speak_text`) retries up to 3 times with 0.5 s and 1.0 s back-off for transient connection drops.
 - HTTP 4xx responses (bad input, quota) fail immediately without retrying.
 - Markdown is stripped before synthesis so the TTS doesn't read "asterisk" or "hash" aloud.
 - Time ranges like "9 AM–10 AM" are rewritten to "9 AM to 10 AM" for natural-sounding speech.
@@ -403,13 +415,15 @@ Each session maintains an in-memory `_slot_cache` keyed by `"date:tz_name"` with
 | `GET` | `/auth/callback` | No | OAuth callback — exchanges authorization code for tokens |
 | `GET` | `/auth/status` | No | `{"authenticated": bool}` |
 | `POST` | `/auth/logout` | Cookie | Clears server-side session and deletes cookie |
-| `POST` | `/chat` | Cookie | Send message → `{"reply": str}` |
+| `POST` | `/chat` | Cookie | Send message → **SSE stream** of `{"token"}` / `{"reply", "done", "timing"}` events |
 | `GET` | `/test-calendar` | Cookie | List tomorrow's free slots (debug endpoint) |
 | `POST` | `/voice/transcribe` | Cookie | Upload audio file → `{"text": str}` |
 | `POST` | `/voice/synthesize` | Cookie | `{"text": str}` → WAV audio bytes |
 | `POST` | `/session/reset` | Cookie | Clears slot cache and conversation context; preserves Google auth |
 
 ### `POST /chat`
+
+Returns `Content-Type: text/event-stream`. Each SSE event is a JSON object on a `data:` line.
 
 ```json
 // Request body
@@ -418,13 +432,23 @@ Each session maintains an in-memory `_slot_cache` keyed by `"date:tz_name"` with
   "timezone": "America/New_York"
 }
 
-// Response
-{
-  "reply": "Booking **Project Review** on Thursday, April 7 at 10:00–11:00 AM. Shall I go ahead?"
-}
+// SSE event stream — scheduling path (one event, no token streaming)
+data: {"reply": "Booking **Project Review** on Thursday, April 7 at 10 AM–11 AM. Shall I go ahead?", "done": true, "timing": {...}}
+
+// SSE event stream — unknown-intent fallback path (word-by-word then done)
+data: {"token": "I"}
+data: {"token": " only"}
+data: {"token": " handle"}
+data: {"token": " scheduling."}
+data: {"reply": "I only handle scheduling.", "done": true, "timing": {...}}
 ```
 
-In development mode (`ENVIRONMENT=development`), the response also includes a `timing` object with per-step latency in milliseconds (LLM call, each calendar tool, total).
+**When tokens are streamed vs. not:**
+- **Scheduling paths** (`find_slot`, `check_availability`, `book_explicit`, `confirm`, `cancel`, `list_events`, `search_event`) — the reply is built entirely by Python with no LLM involved. A single `done` event is emitted immediately after calendar operations complete. No `token` events.
+- **Unknown-intent fallback** — a second LLM call produces a short plain-text reply. Tokens are yielded word-by-word as the LLM streams them, followed by the `done` event.
+- **Intent extraction** (`extract_intent`) is always a **blocking non-streaming** call — it produces JSON that must be fully received before it can be parsed. It never emits token events.
+
+The `timing` object in the `done` event contains per-step latency in milliseconds (`groq_calls`, `tools`, `total_ms`). This is always present regardless of `ENVIRONMENT`.
 
 ### `POST /voice/transcribe`
 
@@ -432,7 +456,7 @@ Accepts `multipart/form-data` with an `audio` file field. Any browser-recorded f
 
 ### `POST /voice/synthesize`
 
-Returns raw `audio/wav` bytes. In development, the `X-Timing-Ms` response header contains synthesis latency.
+Returns `Content-Type: audio/wav` as a **streamed response** — bytes are piped from Groq Orpheus to the client as they arrive without buffering the full file on the backend. The browser parses the 44-byte WAV header from the first chunk, then schedules each subsequent PCM16 block onto the Web Audio timeline, so playback begins before the full file is downloaded.
 
 ---
 

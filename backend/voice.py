@@ -113,3 +113,54 @@ def speak_text(text: str) -> bytes:
     log.error("[voice] tts error: %s", last_exc)
     raise RuntimeError(f"Speech synthesis failed: {last_exc}") from last_exc
 
+
+async def speak_text_iter(text: str):
+    """
+    Async generator that streams WAV bytes from Orpheus without buffering the
+    full response in the backend.  Use with FastAPI StreamingResponse.
+
+    The same text-cleaning logic as speak_text() is applied.  Orpheus returns
+    standard PCM WAV (16-bit little-endian) so the frontend can progressively
+    schedule chunks via the Web Audio API.
+    """
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not set")
+
+    # Identical cleaning pipeline as speak_text()
+    clean = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)
+    clean = re.sub(r'_{1,2}(.*?)_{1,2}', r'\1', clean)
+    clean = re.sub(r'`+.*?`+', '', clean)
+    clean = re.sub(r'^#{1,6}\s*', '', clean, flags=re.MULTILINE)
+    clean = re.sub(
+        r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM))\s*[\u2013\u2014\-]\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM))',
+        r'\1 to \2', clean
+    )
+    clean = clean.strip()[:200]
+
+    import httpx as _httpx  # already imported at module level; alias avoids shadowing
+    async with _httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST",
+            "https://api.groq.com/openai/v1/audio/speech",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "canopylabs/orpheus-v1-english",
+                "voice": "troy",
+                "input": clean,
+                "response_format": "wav",
+            },
+            timeout=30.0,
+        ) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                raise RuntimeError(
+                    f"Speech synthesis failed: {response.status_code} {body.decode(errors='replace')}"
+                )
+            log.info("[voice] streaming TTS for %d chars", len(clean))
+            async for chunk in response.aiter_bytes(chunk_size=4096):
+                yield chunk
+

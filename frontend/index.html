@@ -311,29 +311,61 @@
       if (!panel) return;
       panel.style.display = 'block';
 
-      const row = (label, val, sub) =>
-        `<div class="tp-row"><span class="tp-label">${label}</span><span class="tp-val">${val}</span></div>` +
+      // All measured durations for proportional bar scaling
+      const allMs = [
+        sttMs,
+        ...(chatTiming ? (chatTiming.groq_calls || []).map(g => g.ms) : []),
+        ...(chatTiming ? (chatTiming.tools      || []).map(t => t.ms) : []),
+        ttsMs,
+      ].filter(v => v != null);
+      const maxMs = Math.max(...allMs, 1);
+
+      const bar = ms =>
+        `<div style="margin-top:3px;height:3px;border-radius:2px;background:#30d158;width:${Math.round((ms/maxMs)*100)}%;opacity:.7"></div>`;
+
+      const row = (label, ms, sub) =>
+        `<div class="tp-row"><span class="tp-label">${label}</span><span class="tp-val">${ms} ms</span></div>` +
+        `${bar(ms)}` +
         (sub ? `<div class="tp-sub">${sub}</div>` : '');
+
+      // Tool name → friendly label mapping
+      const toolLabel = name => ({
+        'check_slot':        'Google: check slot',
+        'book_slot':         'Google: book slot',
+        'get_availability':  'Google: get availability',
+        'find_next_slot':    'Google: find next slot',
+        'find_slot_in_range':'Google: find slot in range',
+        'get_events':        'Google: list events',
+        'search_event':      'Google: search event',
+        'search_event(anchor)': 'Google: search anchor',
+      }[name] || `Google: ${name}`);
 
       let html = '<div class="tp-header">⏱ Request Timing</div>';
 
       if (sttMs != null)
-        html += row('STT (Whisper)', `${sttMs} ms`);
+        html += row('STT (Whisper)', sttMs);
 
       if (chatTiming) {
-        const gcSubs = (chatTiming.groq_calls || [])
-          .map(g => `iter ${g.iter}: ${g.ms} ms`).join(' · ');
-        const toolSubs = (chatTiming.tools || [])
-          .map(t => `${t.name}: ${t.ms} ms`).join('<br>');
-        html += row('LLM (Groq)', `${chatTiming.total_ms} ms`, gcSubs || null);
-        if (toolSubs) html += `<div class="tp-sub">${toolSubs}</div>`;
+        const calls = chatTiming.groq_calls || [];
+        const tools = chatTiming.tools      || [];
+
+        // LLM rows — one per Groq call
+        for (const g of calls) {
+          const label = g.iter === 0 ? 'LLM: intent extract' : 'LLM: fallback reply';
+          html += row(label, g.ms);
+        }
+
+        // Calendar tool rows — each gets its own bar
+        for (const t of tools) {
+          html += row(toolLabel(t.name), t.ms);
+        }
       }
 
       if (ttsMs != null)
-        html += row('TTS (Orpheus)', `${ttsMs} ms`);
+        html += row('TTS first byte (Orpheus)', ttsMs);
 
       if (micToVoiceMs != null)
-        html += `<div class="tp-row tp-total"><span>🎙 Mic stop → first audio</span><span>${micToVoiceMs} ms</span></div>`;
+        html += `<div class="tp-row tp-total" style="margin-top:6px"><span>🎙 Mic stop → first audio</span><span>${micToVoiceMs} ms</span></div>`;
 
       panel.innerHTML = html;
 
@@ -409,6 +441,14 @@
       return div;
     }
 
+    // Update an existing agent bubble in-place (used while streaming tokens)
+    function _updateBubble(div, text) {
+      const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      div.innerHTML = esc.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      const t = document.getElementById('transcript');
+      t.scrollTop = t.scrollHeight;
+    }
+
     async function sendMessage() {
       const input = document.getElementById('msg-input');
       const btn   = document.getElementById('send-btn');
@@ -420,11 +460,13 @@
       addBubble('user', text);
       const thinking = addBubble('thinking', 'Thinking…');
 
-      // Reset timing panel for text-only messages (mic sets _micStoppedAt via VAD)
       if (_micStoppedAt === null) _resetTiming();
-      // Hide stale timing
       const panel = document.getElementById('timing-panel');
       if (panel) panel.style.display = 'none';
+
+      let agentBubble = null;
+      let fullReply = '';
+      let gotDone = false;
 
       try {
         const res = await fetch('/chat', {
@@ -433,19 +475,77 @@
           credentials: 'include',
           body: JSON.stringify({ message: text, timezone: tz }),
         });
-        const data = await res.json();
-        thinking.remove();
-        const reply = data.reply || data.error || 'Something went wrong.';
-        if (data.timing) _chatTiming = data.timing;
-        addBubble('agent', reply);
-        if (data.reply) speakReply(data.reply);
-        // For text-only (no mic), show timing without mic-to-voice stat
-        if (_micStoppedAt === null && appMode === 'development') {
-          showTiming({ sttMs: null, chatTiming: _chatTiming, ttsMs: null, micToVoiceMs: null });
+
+        // Non-2xx means an error JSON was returned (auth, rate-limit, etc.)
+        if (!res.ok) {
+          const data = await res.json();
+          thinking.remove();
+          addBubble('agent', data.error || 'Something went wrong.');
+          return;
+        }
+
+        // Consume the SSE stream.
+        // Event shapes (JSON after "data: "):
+        //   {"token": "…"}                           – streaming token (fallback LLM only)
+        //   {"reply": "…", "done": true, "timing": {…}} – final event (all paths)
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+
+          // SSE events are delimited by \n\n
+          const blocks = sseBuffer.split('\n\n');
+          sseBuffer = blocks.pop(); // keep any incomplete trailing block
+
+          for (const block of blocks) {
+            const line = block.trim();
+            if (!line.startsWith('data: ')) continue;
+            let evt;
+            try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+            if (evt.token) {
+              // First token: swap thinking bubble for a real agent bubble
+              if (!agentBubble) {
+                thinking.remove();
+                agentBubble = addBubble('agent', '');
+              }
+              fullReply += evt.token;
+              _updateBubble(agentBubble, fullReply);
+            }
+
+            if (evt.done) {
+              gotDone = true;
+              const replyText = evt.reply || fullReply;
+              if (!agentBubble) {
+                // Single-shot reply (route path) — no prior tokens
+                thinking.remove();
+                agentBubble = addBubble('agent', replyText);
+              } else if (evt.reply) {
+                // Use server’s canonical accumulated text in case of minor drift
+                fullReply = evt.reply;
+                _updateBubble(agentBubble, fullReply);
+              }
+              if (evt.timing) _chatTiming = evt.timing;
+              if (replyText) speakReply(replyText);
+              if (_micStoppedAt === null && appMode === 'development') {
+                showTiming({ sttMs: null, chatTiming: _chatTiming, ttsMs: null, micToVoiceMs: null });
+              }
+            }
+          }
+        }
+
+        // Stream closed without a done event — server error was caught and logged
+        if (!gotDone) {
+          if (thinking.parentNode) thinking.remove();
+          if (!agentBubble) addBubble('agent', 'Something went wrong — please try again.');
         }
       } catch (e) {
-        thinking.remove();
-        addBubble('agent', 'Network error — is the server running?');
+        if (thinking.parentNode) thinking.remove();
+        if (!agentBubble) addBubble('agent', 'Network error — is the server running?');
       } finally {
         btn.disabled = false;
         input.focus();
@@ -496,30 +596,127 @@
       }
     }
 
+    // ── WAV progressive-playback helpers ──────────────────────────────────
+    // The server streams raw PCM WAV (standard 44-byte header, PCM16 LE).
+    // We parse the header from the first chunk, then schedule each subsequent
+    // chunk of PCM samples onto the Web Audio timeline so playback starts as
+    // soon as the first real audio chunk arrives.
+
+    function _parseWavHeader(bytes) {
+      // bytes is Uint8Array of at least 44 bytes
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const marker = String.fromCharCode(bytes[36], bytes[37], bytes[38], bytes[39]);
+      if (marker !== 'data') return null; // non-standard layout; fall back
+      return {
+        numChannels:  view.getUint16(22, true),
+        sampleRate:   view.getUint32(24, true),
+        bitsPerSample: view.getUint16(34, true),
+      };
+    }
+
+    // Schedule pcmBytes on audioCtx starting at scheduleAt.
+    // Returns the duration (seconds) of this chunk so the caller can advance scheduleAt.
+    function _schedulePcmChunk(audioCtx, wavInfo, pcmBytes, scheduleAt) {
+      const { numChannels, sampleRate, bitsPerSample } = wavInfo;
+      const bytesPerSample = bitsPerSample / 8;
+      const numFrames = Math.floor(pcmBytes.length / (bytesPerSample * numChannels));
+      if (numFrames === 0) return 0;
+
+      const buffer = audioCtx.createBuffer(numChannels, numFrames, sampleRate);
+      const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+
+      for (let ch = 0; ch < numChannels; ch++) {
+        const channelData = buffer.getChannelData(ch);
+        for (let i = 0; i < numFrames; i++) {
+          const byteIdx = (i * numChannels + ch) * bytesPerSample;
+          channelData[i] = bitsPerSample === 16
+            ? view.getInt16(byteIdx, true) / 32768
+            : (view.getUint8(byteIdx) - 128) / 128;
+        }
+      }
+
+      const src = audioCtx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(audioCtx.destination);
+      // Never schedule in the past; add tiny safety margin
+      src.start(Math.max(scheduleAt, audioCtx.currentTime + 0.01));
+      return numFrames / sampleRate;
+    }
+
     async function speakReply(text) {
       try {
+        const t_sent = Date.now();
         const res = await fetch('/voice/synthesize', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
           body: JSON.stringify({ text }),
         });
-        if (!res.ok) return;  // TTS is best-effort; silently ignore API errors
-        const ttsTimingMs = res.headers.get('X-Timing-Ms');
-        if (ttsTimingMs != null) _ttsMs = parseInt(ttsTimingMs, 10);
-        const buf = await res.arrayBuffer();
-        // Stamp end-to-end time here — audio bytes received from server.
-        // This is the true mic-stop → audio-delivered latency.
+        if (!res.ok) return; // best-effort; silently ignore API errors
+
+        const reader = res.body.getReader();
+        const audioCtx = getAudioCtx();
+
+        let headerAccum = new Uint8Array(0); // accumulate until we have 44 bytes
+        let wavInfo = null;
+        let scheduleAt = audioCtx.currentTime + 0.08; // 80 ms initial buffer
+        let firstByteReceived = false;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value || value.length === 0) continue;
+
+          if (!firstByteReceived) {
+            _ttsMs = Date.now() - t_sent; // time-to-first-byte
+            firstByteReceived = true;
+          }
+
+          if (!wavInfo) {
+            // Accumulate until we have the full 44-byte WAV header
+            const merged = new Uint8Array(headerAccum.length + value.length);
+            merged.set(headerAccum);
+            merged.set(value, headerAccum.length);
+            headerAccum = merged;
+
+            if (headerAccum.length >= 44) {
+              wavInfo = _parseWavHeader(headerAccum);
+              if (!wavInfo) {
+                // Non-standard WAV: collect everything and do a single decode
+                const chunks = [headerAccum];
+                while (true) {
+                  const { value: v, done: d } = await reader.read();
+                  if (d) break;
+                  if (v && v.length) chunks.push(v);
+                }
+                const total = chunks.reduce((s, c) => s + c.length, 0);
+                const full = new Uint8Array(total);
+                let off = 0;
+                for (const c of chunks) { full.set(c, off); off += c.length; }
+                const decoded = await audioCtx.decodeAudioData(full.buffer);
+                const src = audioCtx.createBufferSource();
+                src.buffer = decoded;
+                src.connect(audioCtx.destination);
+                src.start();
+                break;
+              }
+              // Schedule any PCM data that arrived after the header in this same chunk
+              const pcmChunk = headerAccum.subarray(44);
+              if (pcmChunk.length > 0) {
+                scheduleAt += _schedulePcmChunk(audioCtx, wavInfo, pcmChunk, scheduleAt);
+              }
+              headerAccum = null;
+            }
+          } else {
+            // Full PCM chunk — schedule immediately
+            scheduleAt += _schedulePcmChunk(audioCtx, wavInfo, value, scheduleAt);
+          }
+        }
+
         const micToVoiceMs = _micStoppedAt ? Date.now() - _micStoppedAt : null;
         if (appMode === 'development') {
           showTiming({ sttMs: _sttMs, chatTiming: _chatTiming, ttsMs: _ttsMs, micToVoiceMs });
         }
-        const audioCtx = (window.getAudioCtx ? window.getAudioCtx() : new (window.AudioContext || window.webkitAudioContext)());
-        const decoded = await audioCtx.decodeAudioData(buf);
-        const src = audioCtx.createBufferSource();
-        src.buffer = decoded;
-        src.connect(audioCtx.destination);
-        src.start();
       } catch { /* best-effort */ }
     }
 

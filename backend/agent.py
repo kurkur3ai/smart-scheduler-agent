@@ -685,3 +685,135 @@ def run_agent(
     log.debug("[timing] run_agent total=%dms", timing["total_ms"])
     log.info("[agent] reply: %s", reply[:120])
     return reply, timing
+
+
+# ── Streaming entry point ──────────────────────────────────────────────────────
+
+def run_agent_stream(
+    user_message: str,
+    credentials: Credentials,
+    user_timezone: str = "UTC",
+    slot_cache: dict | None = None,
+):
+    """
+    Sync generator version of run_agent.  Yields SSE-formatted strings:
+
+        data: {"token": "…"}              — incremental token (fallback LLM only)
+        data: {"reply": "…", "done": true, "timing": {…}}  — final event
+
+    INTERNAL Llama calls (intent extraction via extract_intent) are NEVER
+    streamed — they need the complete JSON response before parsing can occur.
+    Tokens are only yielded for user-visible output (_fallback_reply path).
+
+    Starlette wraps this sync generator with iterate_in_threadpool so blocking
+    Groq / Google Calendar calls run in a thread pool, not the event loop.
+    """
+    t_agent = time.perf_counter()
+    timing: dict = {"groq_calls": [], "tools": [], "total_ms": 0}
+    if slot_cache is None:
+        slot_cache = {}
+
+    try:
+        today = _today_str(user_timezone)
+        model = MODEL_PRIMARY
+
+        # Step 0: zero-token fast path
+        fast = _fast_intent(user_message)
+        if fast in ("confirm", "cancel") and not slot_cache.get("_pending"):
+            log.debug("[agent-stream] fast=%s but no _pending — delegating to LLM", fast)
+            fast = None
+        if fast:
+            intent: dict = {"action": fast}
+            log.info("[agent-stream] fast intent: %s", fast)
+        else:
+            # Step 1: BLOCKING non-streaming LLM call — needs full JSON to parse.
+            # We NEVER stream this call; streaming a JSON-producing call would break
+            # parsing because we'd only see partial tokens, not a valid JSON object.
+            prev_context = slot_cache.get("_last_context", "")
+            _pending_now = slot_cache.get("_pending")
+            if _pending_now:
+                pending_ctx = f"pending={_pending_now['title']} at {_pending_now['display']}"
+                prev_context = f"{prev_context},{pending_ctx}" if prev_context else pending_ctx
+            _t = time.perf_counter()
+            try:
+                intent = extract_intent(user_message, user_timezone, prev_context, model=model)
+            except RateLimitError:
+                log.warning("[agent-stream] rate limit, retrying with %s", MODEL_FALLBACK)
+                try:
+                    intent = extract_intent(user_message, user_timezone, prev_context, model=MODEL_FALLBACK)
+                    model = MODEL_FALLBACK
+                except (RateLimitError, Exception):
+                    timing["total_ms"] = round((time.perf_counter() - t_agent) * 1000)
+                    msg = "I'm being rate limited right now. Please try again in a moment."
+                    yield f"data: {json.dumps({'reply': msg, 'done': True, 'timing': timing})}\n\n"
+                    return
+            except Exception as exc:
+                log.error("[agent-stream] intent extraction failed: %s", exc)
+                intent = {"action": "unknown"}
+            groq_ms = round((time.perf_counter() - _t) * 1000)
+            timing["groq_calls"].append({"iter": 0, "ms": groq_ms})
+            log.info("[agent-stream] intent=%s (%.0fms)", json.dumps(intent)[:150], groq_ms)
+
+        if not fast:
+            intent = _apply_context_carryover(intent, slot_cache.get("_last_context", ""))
+
+        if intent.get("action") not in ("confirm", "cancel"):
+            slot_cache["_last_context"] = _intent_to_context(intent)
+
+        # Step 2: deterministic routing (zero LLM tokens)
+        reply = _route(intent, credentials, slot_cache, user_timezone, today, timing)
+
+        # Most common path: route returned a fully-built string (no LLM involved).
+        if reply is not None:
+            timing["total_ms"] = round((time.perf_counter() - t_agent) * 1000)
+            log.info("[agent-stream] reply (route): %s", reply[:120])
+            yield f"data: {json.dumps({'reply': reply, 'done': True, 'timing': timing})}\n\n"
+            return
+
+        # Pending confirmation shortcut (no LLM needed)
+        pending = slot_cache.get("_pending")
+        if pending:
+            reply = f"Did you want to confirm booking **{pending['title']}** at {pending['display']}?"
+            timing["total_ms"] = round((time.perf_counter() - t_agent) * 1000)
+            yield f"data: {json.dumps({'reply': reply, 'done': True, 'timing': timing})}\n\n"
+            return
+
+        # Step 3: fallback LLM — the ONLY place tokens stream word-by-word.
+        _t = time.perf_counter()
+        accumulated = ""
+        try:
+            stream = _client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a voice scheduling assistant. "
+                        "You can ONLY check availability and book meetings. "
+                        "Reply in one short sentence, 10 words max."
+                    )},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.2,
+                max_tokens=40,
+                stream=True,
+            )
+            for chunk in stream:
+                token = chunk.choices[0].delta.content or ""
+                if token:
+                    accumulated += token
+                    yield f"data: {json.dumps({'token': token})}\n\n"
+        except Exception:
+            accumulated = "I didn't understand that. Could you say that differently?"
+            yield f"data: {json.dumps({'token': accumulated})}\n\n"
+
+        timing["groq_calls"].append({"iter": "fallback", "ms": round((time.perf_counter() - _t) * 1000)})
+        timing["total_ms"] = round((time.perf_counter() - t_agent) * 1000)
+        log.info("[agent-stream] reply (fallback stream): %s", accumulated[:120])
+        yield f"data: {json.dumps({'reply': accumulated, 'done': True, 'timing': timing})}\n\n"
+
+    except Exception as exc:
+        # Catch-all: something unexpected blew up after the stream was opened.
+        # Always yield a done event so the frontend can exit the thinking state.
+        import traceback as _tb
+        log.error("[agent-stream] unhandled error: %s\n%s", exc, _tb.format_exc())
+        timing["total_ms"] = round((time.perf_counter() - t_agent) * 1000)
+        yield f"data: {json.dumps({'reply': f'Error: {exc}', 'done': True, 'timing': timing})}\n\n"
