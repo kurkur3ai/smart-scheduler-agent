@@ -12,6 +12,7 @@
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, date as _date
 from zoneinfo import ZoneInfo
@@ -187,6 +188,13 @@ def _fast_intent(user_message: str) -> str | None:
         return "confirm"
     if msg in _CANCEL_WORDS:
         return "cancel"
+    # Handle comma-joined phrases like "yeah, go ahead" or "ok, book it"
+    parts = [p.strip().rstrip(".") for p in msg.split(",")]
+    if len(parts) > 1:
+        if any(p in _CANCEL_WORDS for p in parts):  # cancel takes priority
+            return "cancel"
+        if any(p in _CONFIRM_WORDS for p in parts):
+            return "confirm"
     return None
 
 
@@ -264,6 +272,7 @@ def _route(
             )
             timing["tools"].append({"name": "book_slot", "ms": round((time.perf_counter() - _t) * 1000)})
             slot_cache.pop("_pending", None)
+            slot_cache.pop("_last_context", None)  # clear stale context so next request starts fresh
             return f"Done! **{pending['title']}** is on your calendar for {pending['display']}."
         except Exception as exc:
             log.error("[router] book_slot error: %s", exc)
@@ -466,6 +475,15 @@ def _route(
                 anc = search_event(creds, anchor, anchor_search_start, anchor_search_end, tz_name)
                 timing["tools"].append({"name": "search_event(anchor)", "ms": round((time.perf_counter() - _t) * 1000)})
                 anc_events = anc.get("events", [])
+                if not anc_events:
+                    # Retry with normalized query: "kick-off" → "kick off", "kickoff" → "kickoff"
+                    anchor_norm = re.sub(r'[^a-z0-9 ]+', ' ', anchor.lower()).strip()
+                    anchor_norm = re.sub(r' +', ' ', anchor_norm)
+                    if anchor_norm != anchor.lower():
+                        anc2 = search_event(creds, anchor_norm, anchor_search_start, anchor_search_end, tz_name)
+                        anc_events = anc2.get("events", [])
+                        if anc_events:
+                            log.debug("[router] anchor found via normalized query '%s'", anchor_norm)
                 if anc_events:
                     ae = anc_events[0]
                     ae_date = ae["date"]
@@ -601,13 +619,25 @@ def run_agent(
     model = MODEL_PRIMARY
 
     # Step 0: zero-token fast path for obvious confirm/cancel
+    # Only commit to fast path if there's actually a pending booking to act on;
+    # otherwise fall through to LLM so it can re-interpret the message.
     fast = _fast_intent(user_message)
+    if fast in ("confirm", "cancel") and not slot_cache.get("_pending"):
+        log.debug("[agent] fast=%s but no _pending — delegating to LLM", fast)
+        fast = None
     if fast:
         intent: dict = {"action": fast}
         log.info("[agent] fast intent: %s", fast)
     else:
         # Step 1: LLM intent extraction (~150 tokens)
         prev_context = slot_cache.get("_last_context", "")
+        # If there's a pending booking, append it to context so the LLM can
+        # correctly classify ambiguous confirm/cancel phrases (e.g. "yeah, go ahead")
+        # without needing exhaustive hardcoded word lists.
+        _pending_now = slot_cache.get("_pending")
+        if _pending_now:
+            pending_ctx = f"pending={_pending_now['title']} at {_pending_now['display']}"
+            prev_context = f"{prev_context},{pending_ctx}" if prev_context else pending_ctx
         _t = time.perf_counter()
         try:
             intent = extract_intent(user_message, user_timezone, prev_context, model=model)
