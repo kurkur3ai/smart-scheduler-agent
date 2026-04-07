@@ -72,8 +72,11 @@ _PERIOD_TIMES = {
 
 def _build_iso(date_str: str, time_str: str, tz_name: str) -> str:
     tz = ZoneInfo(tz_name)
+    # Strip any range suffix the LLM might produce (e.g. "13:00-14:00" → "13:00").
+    # Only the start time matters here; duration_minutes carries the end.
+    time_str = re.split(r'[-\u2013\u2014]', time_str.strip())[0].strip()
     # Resolve period words → concrete HH:MM before parsing
-    resolved = _PERIOD_TIMES.get(time_str.strip().lower(), time_str)
+    resolved = _PERIOD_TIMES.get(time_str.lower(), time_str)
     dt = datetime.strptime(f"{date_str} {resolved}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
     return dt.isoformat()
 

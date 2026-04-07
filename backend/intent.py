@@ -23,7 +23,7 @@ import re
 from datetime import datetime, timedelta, date as _date
 from zoneinfo import ZoneInfo
 
-from groq import Groq, RateLimitError
+from groq import Groq, RateLimitError, BadRequestError
 
 log = logging.getLogger("intent")
 
@@ -32,14 +32,18 @@ MODEL = "llama-3.1-8b-instant"
 MODEL_FALLBACK = "llama-3.3-70b-versatile"
 
 _SYSTEM = (
-    "Extract scheduling intent as JSON. Output only valid JSON. "
-    "IMPORTANT: 'before X' means not_after=X (deadline), NOT time=X. "
-    "'after X' means not_before=X. time= is ONLY for exact start times. "
-    "CRITICAL: date=null if the user did NOT mention a date, day, or time period — "
-    "never default to today unless the user explicitly said 'today'. "
-    "Use the get_date_map tool whenever the user says something like "
-    "'last weekday of next week', 'end of next month', 'second Tuesday of May', "
-    "or any other date you cannot compute from today/tomorrow alone."
+    "Extract scheduling intent as JSON. Output only valid JSON.\n"
+    "Rules:\n"
+    "1. time= is a single HH:MM start only. '1pm to 2pm' → time=13:00, duration_minutes=60.\n"
+    "2. 'before X' → not_after=X (deadline). 'after X' → not_before=X. Neither sets time=.\n"
+    "3. date= must be null unless the message contains a date, day name, or relative day word "
+    "(today/tomorrow/this Friday/next Monday/etc.). A clock time alone never implies a date.\n"
+    "4. If Prev: has date=YYYY-MM-DD and the message has no new date or day word, return date=null "
+    "— the caller will reuse the previous date.\n"
+    "5. RefDates resolve relative words only (tomorrow, next week, this Friday). "
+    "Never use RefDates as a default when the date is absent.\n"
+    "6. Call get_date_map only for complex relative expressions you cannot resolve from RefDates "
+    "(e.g. 'last weekday of next month'). Never call it for clock-time-only messages."
 )
 
 _SCHEMA = (
@@ -167,7 +171,7 @@ def extract_intent(
     today_str    = datetime.now(tz).date().isoformat()
     tomorrow_str = (datetime.now(tz).date() + timedelta(days=1)).isoformat()
 
-    parts = [f"Dates:today={today_str},tomorrow={tomorrow_str}"]
+    parts = [f"RefDates:today={today_str},tomorrow={tomorrow_str}"]
     if prev_context:
         parts.append(f"Prev:{prev_context}")
     parts.append(f"Schema:{_SCHEMA}")
@@ -243,6 +247,24 @@ def extract_intent(
         return {"action": "unknown"}
     except RateLimitError:
         raise
+    except BadRequestError as exc:
+        # llama-3.1-8b-instant sometimes wraps its answer in a bogus
+        # <function=extract_scheduling_intent>{...}</function> envelope
+        # instead of returning JSON directly.  The valid intent JSON is
+        # preserved in exc.body["error"]["failed_generation"] — recover it.
+        body = getattr(exc, "body", None) or {}
+        failed = (body.get("error") or {}).get("failed_generation", "")
+        if failed:
+            m = re.search(r'\{.*\}', failed, re.DOTALL)
+            if m:
+                try:
+                    recovered = _parse_raw(m.group(0))
+                    log.info("[intent] recovered intent from failed_generation: %s", json.dumps(recovered)[:120])
+                    return recovered
+                except json.JSONDecodeError:
+                    pass
+        log.error("Intent extraction BadRequestError (unrecoverable): %s", exc)
+        return {"action": "unknown"}
     except Exception as exc:
         log.error("Intent extraction error: %s", exc)
         return {"action": "unknown"}
